@@ -1,0 +1,14 @@
+fastapi
+uvicorn[standard]
+pydantic
+python-multipart
+PyJWT
+langchain-core
+langchain
+langchain-community
+sentence-transformers
+faiss-cpu
+pypdf
+httpx
+beautifulsoup4
+readability-lxml

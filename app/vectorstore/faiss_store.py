@@ -88,7 +88,7 @@ class FaissIndex:
     def search(self, query:str, k:int, embedder) -> List[Document]:
         if self._model_name and getattr(embedder,'model_name',None) != self._model_name:
             raise Exception(
-                f"Embedder model {getattr(embedder,"model_name",None)} is not same as index model: {self._model_name}"
+                f"Embedder model {getattr(embedder,'model_name',None)} is not same as index model: {self._model_name}"
             )
         if self.count == 0:
             return []

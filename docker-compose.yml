@@ -1,0 +1,42 @@
+version: "3.9"
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # For Apple Silicon you can force a platform if you want Cloud Run parity:
+      # platform: linux/amd64
+    env_file: .env
+    ports:
+      - "8000:8000"
+    volumes:
+      # Persist FAISS index
+      - faiss_data:/data/indexes/faiss
+      # Optional: persist HuggingFace cache to speed first-run model downloads
+      # - hf_cache:/home/appuser/.cache/huggingface
+    depends_on:
+      - redis
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/health || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  faiss_data:
+  redis_data:
+  # hf_cache:

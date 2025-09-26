@@ -1,0 +1,11 @@
+.git
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+.venv/
+.env
+data/indexes/         # we’ll mount this as a volume instead
+.cache/
+.huggingface/
