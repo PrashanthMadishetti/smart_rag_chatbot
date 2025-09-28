@@ -91,7 +91,7 @@ def build_prompt(
     
 
 
-    cfg = config or PromptBuilderConfig
+    cfg = config or PromptBuilderConfig()
 
     context_budget = max(0,cfg.max_context_chars)
     history_budget = max(0,cfg.max_history_chars)
@@ -125,3 +125,83 @@ def build_prompt(
         }
     }
     return payload
+
+# --- Compatibility layer expected by C1 / tests ---
+
+from dataclasses import dataclass
+from typing import List, Optional, Dict, Any
+
+# Keeps your original config name as the primary one
+PromptConfig = PromptBuilderConfig  # alias for compatibility
+
+
+@dataclass(frozen=True)
+class PromptChunk:
+    content: str
+    source: str
+    chunk_id: str
+
+
+@dataclass(frozen=True)
+class HistoryTurn:
+    role: str  # "user" | "assistant"
+    text: str
+
+
+@dataclass(frozen=True)
+class PromptInputs:
+    query: str
+    chunks: List[PromptChunk]
+    history: List[HistoryTurn] = None
+    top_k: int = 4
+    provider: str = "stub"
+    mmr_used: bool = False
+
+
+class PromptBuilder:
+    def __init__(self, config: Optional[PromptConfig] = None):
+        self.config = config or PromptBuilderConfig()
+
+    def build(self, inputs: PromptInputs) -> Dict[str, Any]:
+        # Convert PromptChunk -> langchain Document for reuse of your build_prompt
+        from langchain_core.documents import Document
+
+        docs = [
+            Document(
+                page_content=c.content,
+                metadata={"source": c.source, "chunk_id": c.chunk_id},
+            )
+            for c in (inputs.chunks or [])
+        ]
+
+        # Convert HistoryTurn -> (user, assistant) pairs that your build_prompt accepts
+        # We’ll compress consecutive roles into pairs: [(user_text, assistant_text), ...]
+        pairs: List[tuple[str, str]] = []
+        if inputs.history:
+            buf_user = ""
+            buf_assistant = ""
+            for t in inputs.history:
+                if t.role == "user":
+                    # flush previous assistant if any
+                    if buf_user or buf_assistant:
+                        pairs.append((buf_user, buf_assistant))
+                        buf_user, buf_assistant = "", ""
+                    buf_user = t.text or ""
+                elif t.role == "assistant":
+                    buf_assistant = t.text or ""
+                    # close the pair
+                    pairs.append((buf_user, buf_assistant))
+                    buf_user, buf_assistant = "", ""
+            # tail if ended on a user turn
+            if buf_user or buf_assistant:
+                pairs.append((buf_user, buf_assistant))
+
+        return build_prompt(
+            query=inputs.query,
+            chunks=docs,
+            history=pairs,
+            provider=inputs.provider,
+            top_k=inputs.top_k,
+            mmr_used=inputs.mmr_used,
+            config=self.config,
+        )

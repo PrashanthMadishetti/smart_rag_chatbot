@@ -31,8 +31,9 @@ from app.vectorstore.faiss_store import FaissIndex
 from app.retrieval.retriever import Retriever
 
 
-
-
+import redis
+from app.memory.store import MemoryStore
+from app.prompt.builder import HistoryTurn, PromptBuilder,PromptChunk,PromptInputs
 
 
 
@@ -44,6 +45,7 @@ JWT_SECRET = os.getenv("JWT_SECRET", "JWT_SECRET")
 EMBED_MODEL = os.getenv("HF_EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 VECTOR_BACKEND = os.getenv("VECTOR_BACKEND", "faiss")
 INDEX_DIR = os.getenv("INDEX_DIR", "./data/indexes/faiss")
+REDIS_URL = os.getenv("REDIS_URL","redis://redis:6379/0")
 
 # Embedder / Index
 _EMBEDDER = Embedder(model_name=EMBED_MODEL)
@@ -58,6 +60,11 @@ _METRICS = {
     "queries_served_total": 0,
 }
 
+#=========================
+# Redis and Memory
+#=========================
+_redis = redis.from_url(REDIS_URL,decode_response=True)
+_MEMORY = MemoryStore(redis_client=redis, max_turns=6, ttl_seconds=int(os.getenv("MEMORY_TTL_SECONDS", "0" or 0)) or None)
 
 # =========================
 # Auth
@@ -296,14 +303,32 @@ def create_app() -> FastAPI:
 
     #     answer = _stub_llm_answer(body.question, results)
     #     return QueryResponse(answer=answer, sources=sources, provider=(body.provider or "stub"))
+    
+    
     @app.post("/query", response_model=QueryResponse)
-    def query(body: QueryRequest, _: AuthedUser = Depends(require_bearer_auth)):
-    # Use retriever (MMR aware)
+    def query(body: QueryRequest, user: AuthedUser = Depends(require_bearer_auth)):
+        tenant = user.tenant_id or "default"
+        session = body.session_id
+
+        #1 Append User turn
+        try:
+            _MEMORY.append_turn(tenant,session,role="user", text=body.question)
+        except Exception:
+            pass
+
+        #2 Fetch recent history for prompt building
+        raw_history = _MEMORY.get_recent(tenant,session,limit=6)
+        history =[
+            HistoryTurn(role=h["role"],text=h["text"]) 
+            for h in raw_history if isinstance(h,dict) and "role" in h and "text" in h
+        ]
+
+        #3 Retrieve
         results: List[Document] = _RETRIEVER.search(
-            query=body.question,
-            k=body.k,
-            use_mmr=body.use_mmr,
-            mmr_lambda=body.mmr_lambda,
+        query=body.question,
+        k=body.k,
+        use_mmr=getattr(body, "use_mmr", False),
+        mmr_lambda=getattr(body, "mmr_lambda", 0.5),
     )
         _METRICS["queries_served_total"] += 1
 
@@ -313,8 +338,35 @@ def create_app() -> FastAPI:
             if isinstance(src, str):
                 sources.append(src)
 
+        # 4) (Optional) Build prompt using B2 builder
+        chunks = [
+            PromptChunk(content=d.page_content, source=d.metadata.get("source", "unknown"), chunk_id=d.metadata.get("chunk_id", ""))
+            for d in results
+        ]
+        _ = PromptBuilder.build(
+            PromptInputs(
+                query=body.question,
+                chunks=chunks,
+                history=history,
+                top_k=body.k,
+                provider=(body.provider or "stub"),
+                mmr_used=getattr(body, "use_mmr", False),
+            )
+        )
+        # If you want to pass the built prompt to a real LLM later, it's now ready.
+
+        # 5) Stub LLM
         answer = _stub_llm_answer(body.question, results)
+
+        # 6) Append assistant turn
+        try:
+            _MEMORY.append_turn(tenant, session, role="assistant", text=answer)
+        except Exception:
+            pass
+
         return QueryResponse(answer=answer, sources=sources, provider=(body.provider or "stub"))
+
+
     return app
 
 

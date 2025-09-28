@@ -12,3 +12,4 @@ pypdf
 httpx
 beautifulsoup4
 readability-lxml
+redis>=5.0.0
