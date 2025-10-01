@@ -98,10 +98,10 @@ class _ChunkingConfig:
     separators: Tuple[str, ...] =("\n\n", "\n", " ","")
 
 def _reset_scope_key(md:dict) -> Tuple[str,int]:
-    doc_id = md.get("doc_id","")
+    doc_id = str(md.get("doc_id","") or md.get("source") or "")
     if md.get("type") == "pdf" and "page" in md:
-        return (md["doc_id"],md["page"])
-    return (md["doc_id"],0)
+        return (doc_id,md["page"])
+    return (doc_id,0)
 
 def _split_text(text:str, cfg: _ChunkingConfig) -> List[str]:
     splitter = RecursiveCharacterTextSplitter(
@@ -138,7 +138,7 @@ def chunk(
             chunk_id = counters[scope]
             counters[scope] = chunk_id + 1
 
-            page_num = scope[1]
+            doc_id,page_num = scope
             doc_id = base_md.get("doc_id", "")
             chunk_uid = f"{doc_id}:{page_num}:{chunk_id}"
             checksum = _sha256_hex(part.encode("utf-8"))

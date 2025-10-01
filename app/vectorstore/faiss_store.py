@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import List,Tuple,Literal
+from typing import List,Tuple,Literal,Optional
 import os
 import pickle
 from dataclasses import dataclass
@@ -60,7 +60,10 @@ class FaissIndex:
         return int(self._index.ntotal)        
     
 
+    def set_namespace(self,ns:Optional[str]) -> None:
+        self.namespace = ns or "default"
 
+        
 #---------core operations-----------------
 
     def add_documents(self, docs:List[Document],embedder) -> None:

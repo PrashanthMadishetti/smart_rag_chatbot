@@ -6,7 +6,7 @@ class MemoryStore:
     def __init__(self, redis_client, max_turns:int = 6, ttl_seconds:Optional[int] = None):
         self.redis = redis_client
         self.max_turns = int(max_turns)
-        self.ttl_seconds = int(ttl_seconds)
+        self.ttl_seconds = ttl_seconds
     
     @staticmethod
     def _key(tenant_id:str,session_id:str):

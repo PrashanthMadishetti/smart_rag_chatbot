@@ -2,25 +2,34 @@
 from __future__ import annotations
 from typing import List, Sequence, Tuple, Optional
 import math
+import numpy as np
 
 from langchain_core.documents import Document
 from app.embeddings.encoder import Embedder
 from app.vectorstore.faiss_store import FaissIndex
 
 
+# def _cosine(a: Sequence[float], b: Sequence[float]) -> float:
+#     # safe cosine for short/deterministic vectors
+#     num = 0.0
+#     da = 0.0
+#     db = 0.0
+#     for x, y in zip(a, b):
+#         num += float(x) * float(y)
+#         da += float(x) * float(x)
+#         db += float(y) * float(y)
+#     if da == 0.0 or db == 0.0:
+#         return 0.0
+#     return num / math.sqrt(da * db)
 def _cosine(a: Sequence[float], b: Sequence[float]) -> float:
-    # safe cosine for short/deterministic vectors
-    num = 0.0
-    da = 0.0
-    db = 0.0
-    for x, y in zip(a, b):
-        num += x * y
-        da += x * x
-        db += y * y
+    a = np.asarray(a, dtype=float).ravel()
+    b = np.asarray(b, dtype=float).ravel()
+    num = np.dot(a, b)
+    da = np.dot(a, a)
+    db = np.dot(b, b)
     if da == 0.0 or db == 0.0:
         return 0.0
-    return num / math.sqrt(da * db)
-
+    return float(num / math.sqrt(da * db))
 
 # def mmr(
 #     query_vec: Sequence[float],
@@ -171,9 +180,9 @@ class Retriever:
             return []
 
         # 2) Embed query and candidate texts (we re-embed to get vectors for MMR)
-        qv = self.embedder.embed_query(query)
+        qv = self.embedder.encode_texts([query])
         cand_texts = [d.page_content for d in candidates]
-        cand_vecs = self.embedder.embed_documents(cand_texts)
+        cand_vecs = self.embedder.encode_texts(cand_texts)
 
         # 3) Select with MMR, then map back to docs
         chosen_idx = mmr(qv, cand_vecs, lambda_mult=mmr_lambda, k=k)

@@ -3,9 +3,9 @@ from __future__ import annotations
 import os
 import time
 import tempfile
-from typing import List, Optional
-
+from typing import List, Optional,Any
 import jwt
+import redis
 from fastapi import (
     Body,
     Depends,
@@ -20,23 +20,32 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+
+import google.generativeai as genai
+from groq import Groq
+
 from pydantic import BaseModel, Field, field_validator
 from langchain_core.documents import Document
-
 
 from app.ingest.loaders import load_pdfs, load_txts, load_web
 from app.ingest.preprocess import clean, chunk
 from app.embeddings.encoder import Embedder
 from app.vectorstore.faiss_store import FaissIndex
+from app.vectorstore.pinecone_store import PineconeIndex
 from app.retrieval.retriever import Retriever
-
-
-import redis
+from app.auth.auth_router import router as auth_router
+from app.auth.db import Base,engine
 from app.memory.store import MemoryStore
 from app.prompt.builder import HistoryTurn, PromptBuilder,PromptChunk,PromptInputs
 
+#=======================
+# Read keys/models
+#=======================
 
-
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GROQ_API_KEY   = os.getenv("GROQ_API_KEY", "")
+GEMINI_MODEL   = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+GROQ_MODEL     = os.getenv("GROQ_MODEL", "llama-3.1-70b-versatile")
 
 # =========================
 # App-wide singletons
@@ -49,8 +58,15 @@ REDIS_URL = os.getenv("REDIS_URL","redis://redis:6379/0")
 
 # Embedder / Index
 _EMBEDDER = Embedder(model_name=EMBED_MODEL)
-_INDEX = FaissIndex(dimension=_EMBEDDER.dimension, metric="cosine", model_name=_EMBEDDER.model_name)
-_RETRIEVER = Retriever(_INDEX, _EMBEDDER)
+# _INDEX = FaissIndex(dimension=_EMBEDDER.dimension, metric="cosine", model_name=_EMBEDDER.model_name)
+# _RETRIEVER = Retriever(_INDEX, _EMBEDDER)
+
+
+#=====Pinecone========
+PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX","tenant-documents")
+PINECONE_CLOUD = os.getenv("PINECONE_CLOUD","aws")
+PINECONE_REGION = os.getenv("PINECONE_REGION","us-east-1")
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY","")
 
 # Metrics (in-memory)
 _METRICS = {
@@ -66,36 +82,9 @@ _METRICS = {
 _redis = redis.from_url(REDIS_URL,decode_response=True)
 _MEMORY = MemoryStore(redis_client=redis, max_turns=6, ttl_seconds=int(os.getenv("MEMORY_TTL_SECONDS", "0" or 0)) or None)
 
-# =========================
-# Auth
-# =========================
-_bearer = HTTPBearer(auto_error=False)
-
-class AuthedUser(BaseModel):
-    sub: str
-    tenant_id: Optional[str] = None
-
-def require_bearer_auth(auth_headers: HTTPAuthorizationCredentials = Depends(_bearer)) -> AuthedUser:
-    if not auth_headers or auth_headers.scheme.lower() != "bearer":
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
-    token = auth_headers.credentials
-    try:
-        payload = jwt.decode(
-            token,
-            JWT_SECRET,
-            algorithms=["HS256"],
-            options={
-                "require": ["exp", "sub"],
-                "verify_aud": False,
-                "verify_iss": False,
-            },
-        )
-        return AuthedUser(sub=str(payload.get("sub")), tenant_id=payload.get("tenant_id"))
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token expired")
-    except Exception:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=f"Invalid token")
-
+# Lazy init holders
+_GEMINI: Optional[Any] = None
+_GROQ: Optional[Groq] = None
 
 # =========================
 # Schemas
@@ -127,8 +116,78 @@ class QueryResponse(BaseModel):
 
 
 # =========================
+# Auth
+# =========================
+_bearer = HTTPBearer(auto_error=False)
+
+class AuthedUser(BaseModel):
+    sub: str
+    tenant_id: Optional[str] = None
+
+def require_bearer_auth(auth_headers: HTTPAuthorizationCredentials = Depends(_bearer)) -> AuthedUser:
+    if not auth_headers or auth_headers.scheme.lower() != "bearer":
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
+    token = auth_headers.credentials
+    # print(token)
+    try:
+        payload = jwt.decode(
+            token,
+            JWT_SECRET,
+            algorithms=["HS256"],
+            options={
+                "require": ["exp", "sub"],
+                "verify_aud": False,
+                "verify_iss": False,
+            },
+        )
+        return AuthedUser(sub=str(payload.get("sub")), tenant_id=payload.get("tenant_id"))
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token expired")
+    except Exception:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=f"Invalid token")
+
+
+# =========================
 # Helpers
 # =========================
+
+def _get_gemini():
+    global _GEMINI
+    if _GEMINI is None and GEMINI_API_KEY:
+        # print(GEMINI_API_KEY)
+        genai.configure(api_key=GEMINI_API_KEY)
+        # for m in genai.list_models():
+        #     print(m)
+        _GEMINI = genai.GenerativeModel(GEMINI_MODEL)
+    return _GEMINI
+
+def _get_groq():
+    global _GROQ
+    if _GROQ is None and GROQ_API_KEY:
+        _GROQ = Groq(api_key=GROQ_API_KEY)
+    return _GROQ
+
+def _choose_free_llm(provider_hint: Optional[str]) -> tuple[str, str]:
+    """
+    Returns ("gemini"|"groq", model_name). Prefers user hint if available & configured.
+    Falls back: Gemini -> Groq.
+    """
+    hint = (provider_hint or "").lower().strip()
+
+    if hint in ("gemini", "google") and GEMINI_API_KEY:
+        return ("gemini", GEMINI_MODEL)
+    if hint == "groq" and GROQ_API_KEY:
+        return ("groq", GROQ_MODEL)
+
+    # Fallback order: Gemini -> Groq
+    if GEMINI_API_KEY:
+        return ("gemini", GEMINI_MODEL)
+    if GROQ_API_KEY:
+        return ("groq", GROQ_MODEL)
+
+    # Nothing configured – caller should stub
+    return ("stub", "stub")
+
 def _ext_from_upload_file(file: UploadFile) -> str:
     name = (file.filename or "").lower()
     if name.endswith(".pdf") or file.content_type == "application/pdf":
@@ -157,12 +216,30 @@ def _stub_llm_answer(question: str, ctx_docs: List[Document]) -> str:
     prefix = (ctx_docs[0].page_content[:100] if ctx_docs else "")
     return f"[ANSWER] {question} | ctx={prefix}"
 
+def _make_index():
+    if VECTOR_BACKEND == "pinecone":
+        return PineconeIndex(
+            dimension=_EMBEDDER.dimension,
+            metric="cosine",
+            model_name=_EMBEDDER.model_name,
+            index_name=PINECONE_INDEX_NAME,
+            api_key=PINECONE_API_KEY,
+            cloud=PINECONE_CLOUD,
+            region=PINECONE_REGION
+        )
+    return FaissIndex(dimension=_EMBEDDER.dimension,metric="cosine",model_name=_EMBEDDER.model_name)
+_INDEX = _make_index()
+RETRIEVER = Retriever(_INDEX,_EMBEDDER)
+
 
 # =========================
 # FastAPI app
 # =========================
+
 def create_app() -> FastAPI:
     app = FastAPI(title="Smart RAG Chatbot API", version="0.1.0")
+    
+    Base.metadata.create_all(bind=engine)
 
     app.add_middleware(
         CORSMiddleware,
@@ -177,6 +254,8 @@ def create_app() -> FastAPI:
         resp = await call_next(request)
         _METRICS["requests_total"] += 1
         return resp
+    
+    app.include_router(auth_router,prefix="")
 
     @app.get("/health")
     def health():
@@ -196,7 +275,7 @@ def create_app() -> FastAPI:
         urls_json: Optional[IngestUrlsRequest] = Body(None),
         # Form field(s) (optional): supports repeated 'urls' or comma-separated 'urls'
         urls_form: Optional[List[str]] = Form(None),
-        _: AuthedUser = Depends(require_bearer_auth),
+        user: AuthedUser = Depends(require_bearer_auth),
     ):
         started = time.time()
         load_ms = clean_ms = chunk_ms = embed_ms = index_ms = 0
@@ -272,6 +351,12 @@ def create_app() -> FastAPI:
         _METRICS["ingest_chunks_total"] += len(chunks)
 
         t3 = time.time()
+        tenant_ns = user.tenant_id or "default"
+        try:
+            _INDEX.set_namespace(tenant_ns)
+        except Exception:
+            pass
+
         _INDEX.add_documents(chunks, _EMBEDDER)
         index_ms = int((time.time() - t3) * 1000)
 
@@ -309,6 +394,10 @@ def create_app() -> FastAPI:
     def query(body: QueryRequest, user: AuthedUser = Depends(require_bearer_auth)):
         tenant = user.tenant_id or "default"
         session = body.session_id
+        try:
+            _INDEX.set_namespace(tenant)
+        except Exception:
+            pass
 
         #1 Append User turn
         try:
@@ -324,7 +413,7 @@ def create_app() -> FastAPI:
         ]
 
         #3 Retrieve
-        results: List[Document] = _RETRIEVER.search(
+        results: List[Document] = RETRIEVER.search(
         query=body.question,
         k=body.k,
         use_mmr=getattr(body, "use_mmr", False),
@@ -343,8 +432,10 @@ def create_app() -> FastAPI:
             PromptChunk(content=d.page_content, source=d.metadata.get("source", "unknown"), chunk_id=d.metadata.get("chunk_id", ""))
             for d in results
         ]
-        _ = PromptBuilder.build(
-            PromptInputs(
+
+        prompt_builder = PromptBuilder()
+        prompt_payload = prompt_builder.build(
+            inputs=PromptInputs(
                 query=body.question,
                 chunks=chunks,
                 history=history,
@@ -353,18 +444,88 @@ def create_app() -> FastAPI:
                 mmr_used=getattr(body, "use_mmr", False),
             )
         )
-        # If you want to pass the built prompt to a real LLM later, it's now ready.
+        system_txt = prompt_payload["system"]
+        user_msg = prompt_payload["messages"][0]["content"]
 
-        # 5) Stub LLM
-        answer = _stub_llm_answer(body.question, results)
+        #Choose provider
+        prov,model_used = _choose_free_llm(body.provider)
+        # print(f"The provider being used is {prov}")
+
+        answer_text = None
+        provider_used = prov
+        try:
+            if prov=="gemini":
+                gm = _get_gemini()
+                if gm is None:
+                    raise RuntimeError("Gemini Not Configured")
+                
+                gm_sys = genai.GenerativeModel(model_name=GEMINI_MODEL,system_instruction=system_txt)
+
+                resp = gm_sys.generate_content(user_msg)
+                # print(f"The response from the LLM is {resp}")
+                answer_text = (resp.text or "").strip()
+            elif prov == "groq":
+                gq = _get_groq()
+                if gq is None:
+                    raise RuntimeError("Groq not configured")
+                chat = gq.chat.completions.create(
+                    model=model_used,
+                    messages=[
+                        {"role": "system", "content": system_txt},
+                        {"role": "user", "content": user_msg},
+                    ],
+                    temperature=0.2,
+                )
+                answer_text = (chat.choices[0].message.content or "").strip()
+
+        except Exception as e:
+            # Fallback chain: try the other free provider, then stub
+            # print(f"Fell into the EXception block due to {e}")
+            if prov == "gemini" and GROQ_API_KEY:
+                try:
+                    gq = _get_groq()
+                    chat = gq.chat.completions.create(
+                        model=GROQ_MODEL,
+                        messages=[
+                            {"role": "system", "content": system_txt},
+                            {"role": "user", "content": user_msg},
+                        ],
+                        temperature=0.2,
+                    )
+                    answer_text = (chat.choices[0].message.content or "").strip()
+                    provider_used = "groq"
+                    model_used = GROQ_MODEL
+                except Exception:
+                    pass
+            elif prov == "groq" and GEMINI_API_KEY and answer_text is None:
+                try:
+                    gm = _get_gemini()
+                    gm_sys = genai.GenerativeModel(model_name=GEMINI_MODEL, system_instruction=system_txt)
+                    resp = gm_sys.generate_content(user_msg)
+                    answer_text = (resp.text or "").strip()
+                    provider_used = "gemini"
+                    model_used = GEMINI_MODEL
+                except Exception:
+                    pass
+
+        # Final stub if both failed or not configured
+        if not answer_text:
+            answer_text = _stub_llm_answer(body.question, results)
+            provider_used = "stub"
+            model_used = "stub"
+            
+       
+
+        # # 5) Stub LLM
+        # answer = _stub_llm_answer(body.question, results)
 
         # 6) Append assistant turn
         try:
-            _MEMORY.append_turn(tenant, session, role="assistant", text=answer)
+            _MEMORY.append_turn(tenant, session, role="assistant", text=answer_text)
         except Exception:
             pass
 
-        return QueryResponse(answer=answer, sources=sources, provider=(body.provider or "stub"))
+        return QueryResponse(answer=answer_text, sources=sources, provider=(body.provider or "stub"))
 
 
     return app
