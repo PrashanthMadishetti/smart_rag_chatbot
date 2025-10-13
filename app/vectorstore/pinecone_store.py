@@ -16,7 +16,17 @@ except Exception:
 def _md_str(md: Dict[str, Any], key: str, default: str = "") -> str:
     val = md.get(key, default)
     return str(val) if val is not None else default
-
+def _to_jsonable(v):
+    # Pinecone metadata must be JSON-serializable: (str, int, float, bool, None, list, dict)
+    # Anything else -> str(v)
+    if v is None or isinstance(v, (str, int, float, bool)):
+        return v
+    if isinstance(v, (list, tuple)):
+        return [_to_jsonable(x) for x in v]
+    if isinstance(v, dict):
+        return {str(k): _to_jsonable(x) for k, x in v.items()}
+    # e.g. PosixPath, UUID, datetime, numpy types, etc.
+    return str(v)
 
 class PineconeIndex:
     """Pinecone backend Index"""
@@ -88,26 +98,70 @@ class PineconeIndex:
         vectors = []
         for d, v in zip(docs, vecs):
             md = dict(d.metadata or {})
-            doc_id = _md_str(md, "doc_id", "")
-            page = _md_str(md, "page", "0")
+
+            # --- sanitize metadata so Pinecone accepts it ---
+            md = _to_jsonable(md)
+
+            # Normalize commonly-used fields
+            doc_id   = _md_str(md, "doc_id", "")
+            page     = _md_str(md, "page", "0")
             chunk_id = _md_str(md, "chunk_id", "")
             chunk_uid = _md_str(md, "chunk_uid", "") or f"{doc_id}:{page}:{chunk_id or uuid.uuid4().hex}"
 
-            meta = dict(md)
-            meta["text"] = d.page_content or ""
-            meta["model_name"] = self.model_name
+            # Ensure source is a string (handles PosixPath)
+            if "source" in md:
+                md["source"] = _md_str(md, "source", "")
 
-            # v is a 1D numpy array (D,). Convert to a plain list of floats
+            # Keep full text for convenience (counts toward Pinecone’s per-vector metadata size limit)
+            md["text"] = d.page_content or ""
+            md["model_name"] = self.model_name
+
             vectors.append(
                 {
                     "id": chunk_uid,
-                    "values": [float(x) for x in v.tolist()],
-                    "metadata": meta,
+                    "values": [float(x) for x in v.tolist()],  # 1D numpy -> list[float]
+                    "metadata": md,
                 }
             )
 
-        # Batch upsert once (faster & cleaner than inside loop)
         self._index.upsert(vectors=vectors, namespace=self._namespace)
+    # def add_documents(self, docs: List[Document], embedder) -> None:
+    #     if not docs:
+    #         return
+
+    #     texts = [d.page_content or "" for d in docs]
+    #     vecs = embedder.encode_texts(texts)  # np.ndarray (N, D)
+
+    #     if not isinstance(vecs, np.ndarray):
+    #         vecs = np.array(vecs, dtype=np.float32)
+    #     if vecs.ndim != 2 or vecs.shape[1] != self.dimension:
+    #         raise ValueError(
+    #             f"Embedding matrix shape {vecs.shape} does not match index dim {self.dimension}"
+    #         )
+
+    #     vectors = []
+    #     for d, v in zip(docs, vecs):
+    #         md = dict(d.metadata or {})
+    #         doc_id = _md_str(md, "doc_id", "")
+    #         page = _md_str(md, "page", "0")
+    #         chunk_id = _md_str(md, "chunk_id", "")
+    #         chunk_uid = _md_str(md, "chunk_uid", "") or f"{doc_id}:{page}:{chunk_id or uuid.uuid4().hex}"
+
+    #         meta = dict(md)
+    #         meta["text"] = d.page_content or ""
+    #         meta["model_name"] = self.model_name
+
+    #         # v is a 1D numpy array (D,). Convert to a plain list of floats
+    #         vectors.append(
+    #             {
+    #                 "id": chunk_uid,
+    #                 "values": [float(x) for x in v.tolist()],
+    #                 "metadata": meta,
+    #             }
+    #         )
+
+    #     # Batch upsert once (faster & cleaner than inside loop)
+    #     self._index.upsert(vectors=vectors, namespace=self._namespace)
 
     # --------- Search -----------
     def search(self, query: str, k: int, embedder) -> List[Document]:
@@ -144,6 +198,27 @@ class PineconeIndex:
             text = md.pop("text", "")
             out.append(Document(page_content=text, metadata=md))
         return out
+    
+    # ... existing imports / class PineconeIndex ...
+
+    # ------ Deletions ------
+    def delete_by_doc_id(self, doc_id: str) -> None:
+        """Delete all vectors for a specific document (by metadata filter)."""
+        if not doc_id:
+            return
+        self._index.delete(
+            namespace=self._namespace,
+            filter={"doc_id": {"$eq": doc_id}},
+        )
+
+    def delete_by_filter(self, md_filter: dict) -> None:
+        """Generic metadata-filtered delete."""
+        if not md_filter:
+            return
+        self._index.delete(
+            namespace=self._namespace,
+            filter=md_filter,
+        )
 
 
 # from __future__ import annotations

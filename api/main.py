@@ -17,6 +17,8 @@ from fastapi import (
     UploadFile,
     status,
 )
+import uuid
+
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -37,6 +39,8 @@ from app.auth.auth_router import router as auth_router
 from app.auth.db import Base,engine
 from app.memory.store import MemoryStore
 from app.prompt.builder import HistoryTurn, PromptBuilder,PromptChunk,PromptInputs
+from app.docs.router import router as docs_router
+from app.docs.models import DocumentRecord
 
 #=======================
 # Read keys/models
@@ -80,7 +84,7 @@ _METRICS = {
 # Redis and Memory
 #=========================
 _redis = redis.from_url(REDIS_URL,decode_response=True)
-_MEMORY = MemoryStore(redis_client=redis, max_turns=6, ttl_seconds=int(os.getenv("MEMORY_TTL_SECONDS", "0" or 0)) or None)
+_MEMORY = MemoryStore(redis_client=_redis, max_turns=6, ttl_seconds=int(os.getenv("MEMORY_TTL_SECONDS", "0" or 0)) or None)
 
 # Lazy init holders
 _GEMINI: Optional[Any] = None
@@ -228,6 +232,16 @@ def _make_index():
             region=PINECONE_REGION
         )
     return FaissIndex(dimension=_EMBEDDER.dimension,metric="cosine",model_name=_EMBEDDER.model_name)
+
+# Determine a title/source for record
+def _guess_title_and_source(first_doc: Document) -> tuple[str, str]:
+    md = first_doc.metadata or {}
+    src = md.get("source") or md.get("file_path") or md.get("url") or "uploaded"
+    # add parentheses so `or` doesn’t bind incorrectly
+    title = md.get("title") or (os.path.basename(str(src)) if isinstance(src, str) else "Document")
+    return str(title), str(src)
+
+
 _INDEX = _make_index()
 RETRIEVER = Retriever(_INDEX,_EMBEDDER)
 
@@ -237,7 +251,11 @@ RETRIEVER = Retriever(_INDEX,_EMBEDDER)
 # =========================
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="Smart RAG Chatbot API", version="0.1.0")
+    app = FastAPI(
+        title="Smart RAG Chatbot API", 
+        version="0.1.0",
+        docs_url="/api-docs",
+        redoc_url=None)
     
     Base.metadata.create_all(bind=engine)
 
@@ -256,6 +274,7 @@ def create_app() -> FastAPI:
         return resp
     
     app.include_router(auth_router,prefix="")
+    app.include_router(docs_router)  
 
     @app.get("/health")
     def health():
@@ -269,31 +288,30 @@ def create_app() -> FastAPI:
     @app.post("/ingest", response_model=IngestResponse)
     async def ingest(
         request: Request,
-        # Multipart file (optional)
         file: Optional[UploadFile] = File(None),
-        # JSON body (optional)
         urls_json: Optional[IngestUrlsRequest] = Body(None),
-        # Form field(s) (optional): supports repeated 'urls' or comma-separated 'urls'
         urls_form: Optional[List[str]] = Form(None),
         user: AuthedUser = Depends(require_bearer_auth),
     ):
+        # Require a tenant-scoped token (login token has no tenant_id)
+        tenant_ns = user.tenant_id
+        if not tenant_ns:
+            raise HTTPException(status_code=403, detail="Tenant token required for ingestion")
+
         started = time.time()
         load_ms = clean_ms = chunk_ms = embed_ms = index_ms = 0
 
-        # ----- Gather URLs from any supported input shape
+        # ----- Gather URLs (any of the supported shapes)
         urls: List[str] = []
 
-        # From explicit JSON model
         if urls_json and urls_json.urls:
             urls.extend(urls_json.urls)
 
-        # From form fields (either repeated 'urls' or comma-separated list)
         if urls_form:
             for item in urls_form:
                 if item:
                     urls.extend([u.strip() for u in item.split(",") if u.strip()])
 
-        # Fallback: if request is application/json but FastAPI didn't bind due to File param presence
         if not urls and file is None:
             ct = request.headers.get("content-type", "")
             if ct.startswith("application/json"):
@@ -306,10 +324,8 @@ def create_app() -> FastAPI:
                         elif isinstance(raw_urls, str):
                             urls.extend([u.strip() for u in raw_urls.split(",") if u.strip()])
                 except Exception:
-                    # ignore parse errors; we'll validate below
                     pass
 
-        # Deduplicate URLs, keep order
         if urls:
             seen = set()
             urls = [u for u in urls if not (u in seen or seen.add(u))]
@@ -338,7 +354,7 @@ def create_app() -> FastAPI:
             )
         load_ms = int((time.time() - t0) * 1000)
 
-        # ----- Clean → Chunk → Index
+        # ----- Clean → Chunk
         t1 = time.time()
         cleaned = [clean(d) for d in docs]
         clean_ms = int((time.time() - t1) * 1000)
@@ -350,17 +366,71 @@ def create_app() -> FastAPI:
         _METRICS["ingest_docs_total"] += len(docs)
         _METRICS["ingest_chunks_total"] += len(chunks)
 
+        # ----- Create a DocumentRecord row (so /docs UI has something to list)
+        # Determine title and source — prefer the uploaded filename if available
+        if file is not None:
+            title = os.path.splitext(file.filename)[0]  # use filename (without extension)
+            source = file.filename
+        else:
+            title, source = _guess_title_and_source(docs[0])
+        # Make a DB session the same way your auth layer does
+        from app.auth.db import get_db
+        db = None
+        doc_rec = None
+        try:
+            db = next(get_db())
+            doc_rec = DocumentRecord(
+                tenant_id=uuid.UUID(tenant_ns),  # tokens carry a UUID tenant_id
+                created_by=uuid.UUID(user.sub) if user.sub else None,
+                title=title,
+                source=source,
+                chunk_count=0,
+            )
+            db.add(doc_rec)
+            db.flush()  # assign doc_rec.id
+            doc_id_str = str(doc_rec.id)
+        except Exception:
+            # If anything goes wrong, still allow indexing (but UI list/delete will miss it)
+            doc_id_str = uuid.uuid4().hex
+        finally:
+            # keep DB open for later commit; we’ll close after indexing
+            pass
+
+        # Attach metadata (doc_id + stable chunk_uid) to every chunk
+        for i, d in enumerate(chunks):
+            md = dict(d.metadata or {})
+            md["doc_id"] = doc_id_str
+            md["chunk_id"] = md.get("chunk_id") or str(i)
+            page = str(md.get("page") or "0")
+            md["chunk_uid"] = md.get("chunk_uid") or f"{doc_id_str}:{page}:{md['chunk_id']}"
+            d.metadata = md
+
+        # ----- Index
         t3 = time.time()
-        tenant_ns = user.tenant_id or "default"
         try:
             _INDEX.set_namespace(tenant_ns)
         except Exception:
             pass
 
         _INDEX.add_documents(chunks, _EMBEDDER)
-        index_ms = int((time.time() - t3) * 1000)
 
+        # Update record with final chunk_count
+        try:
+            if db and doc_rec:
+                doc_rec.chunk_count = len(chunks)
+                db.commit()
+        except Exception:
+            pass
+        finally:
+            try:
+                if db:
+                    db.close()
+            except Exception:
+                pass
+
+        index_ms = int((time.time() - t3) * 1000)
         total_ms = int((time.time() - started) * 1000)
+
         return IngestResponse(
             ingested=len(chunks),
             failures=failures,
@@ -369,7 +439,7 @@ def create_app() -> FastAPI:
                 "load": load_ms,
                 "clean": clean_ms,
                 "chunk": chunk_ms,
-                "embed": embed_ms,  # embedding time is inside add_documents; keep 0 if you prefer
+                "embed": embed_ms,  # if you later time encode_texts, set this properly
                 "index": index_ms,
             },
         )
@@ -392,6 +462,7 @@ def create_app() -> FastAPI:
     
     @app.post("/query", response_model=QueryResponse)
     def query(body: QueryRequest, user: AuthedUser = Depends(require_bearer_auth)):
+        print(body)
         tenant = user.tenant_id or "default"
         session = body.session_id
         try:

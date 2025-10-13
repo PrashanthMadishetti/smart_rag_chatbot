@@ -170,4 +170,43 @@ class FaissIndex:
         
         obj._store = _MemStore(texts=texts,metadata=metadata)
         return obj
+    
+    def delete_by_doc_id(self, doc_id: str) -> None:
+        """
+        Delete all vectors in the current FAISS index that belong to the given document ID.
+        If your FAISS backend keeps a sidecar metadata mapping, it prunes those entries too.
+        """
+        if not hasattr(self, "_metadatas") or not self._metadatas:
+            # No metadata tracking; just reset the index if needed
+            return
+
+        try:
+            # Collect indices of embeddings NOT matching this doc_id
+            keep_indices = [
+                i for i, meta in enumerate(self._metadatas)
+                if str(meta.get("doc_id")) != str(doc_id)
+            ]
+
+            # If all entries are from this doc, just reset everything
+            if not keep_indices:
+                self.index.reset()
+                self._embeddings = []
+                self._metadatas = []
+                return
+
+            # Otherwise, rebuild index with only the kept embeddings
+            kept_embeddings = [self._embeddings[i] for i in keep_indices]
+            kept_metadatas = [self._metadatas[i] for i in keep_indices]
+
+            # Recreate FAISS index
+            import numpy as np
+            self.index.reset()
+            if kept_embeddings:
+                self.index.add(np.array(kept_embeddings, dtype="float32"))
+
+            self._embeddings = kept_embeddings
+            self._metadatas = kept_metadatas
+
+        except Exception as e:
+            print(f"[FAISS] delete_by_doc_id({doc_id}) failed: {e}")
 

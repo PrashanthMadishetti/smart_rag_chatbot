@@ -5,6 +5,32 @@ from typing import List,Tuple,Iterable
 import hashlib
 from dataclasses import dataclass
 
+# app/ingest/text_utils.py
+import re
+import unicodedata
+
+# Regex for surrogate code points (U+D800 through U+DFFF)
+_SURROGATE_RE = re.compile(r"[\uD800-\uDFFF]")
+
+# Control chars except \t \n \r
+_CTRL_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]")
+
+def sanitize_text(s: str) -> str:
+    if not isinstance(s, str):
+        try:
+            s = str(s)
+        except Exception:
+            return ""
+    # Normalize to NFKC (fixes compatibility glyphs)
+    s = unicodedata.normalize("NFKC", s)
+    # Drop surrogate code points (invalid in UTF-8)
+    s = _SURROGATE_RE.sub("", s)
+    # Drop other non-printable control chars
+    s = _CTRL_RE.sub("", s)
+    # Final guard: round-trip through utf-8 ignoring any remaining invalids
+    s = s.encode("utf-8", "ignore").decode("utf-8", "ignore")
+    return s
+
 #ZW spaces/joind + BOM
 _ZEROWIDTH = re.compile(r"[\u200B\u200C\u200D\u2060\ufeff]")
 #ASCII control characters
@@ -45,6 +71,7 @@ def _normalize_text_keep_paragraphs(text:str) -> str:
     '''
     if not text:
         return ""
+    text = sanitize_text(text)
     
     #Strip Zero-width + control characters but keep \n and \t
     text = _ZEROWIDTH.sub(" ", text)
@@ -109,52 +136,62 @@ def _split_text(text:str, cfg: _ChunkingConfig) -> List[str]:
     )
     return splitter.split_text(text)
 
+# counters typing
+counters: dict[tuple[str, int], int] = {}  # or: from typing import Dict, Tuple -> Dict[Tuple[str, int], int]
+
 def chunk(
-        docs: Iterable[Document],
-        chunk_size: int = 800,
-        chunk_overlap:int = 120,
-        separators: Tuple[str, ...] =("\n\n", "\n", " ","")
+    docs: Iterable[Document],
+    chunk_size: int = 800,
+    chunk_overlap: int = 120,
+    separators: Tuple[str, ...] = ("\n\n", "\n", " ", "")
 ) -> List[Document]:
-    '''
-    Split input Documents into overlapping chunks with inherited metadata and 
+    """
+    Split input Documents into overlapping chunks with inherited metadata and
     added fields: chunk_id, chunk_uid, chunk_checksum
 
     chunk_uid format: "{doc_id}:{page or 0}:{chunk_id}"
-    '''
-    cfg = _ChunkingConfig(chunk_size=chunk_size,chunk_overlap=chunk_overlap,separators=separators)
-    out:List[Document] = []
+    """
+    cfg = _ChunkingConfig(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        separators=separators
+    )
+    out: List[Document] = []
 
-
-    #Track counters to reset scope
-    counters: dict[(str,int),int]={}
+    counters: dict[tuple[str, int], int] = {}
 
     for doc in docs:
         base_md = dict(doc.metadata) if doc.metadata else {}
-        scope = _reset_scope_key(base_md)
-        counters.setdefault(scope,0)
+        scope_doc_id, scope_page = _reset_scope_key(base_md)
+        counters.setdefault((scope_doc_id, scope_page), 0)
 
-        parts = _split_text(doc.page_content or "",cfg)
+        parts = _split_text(doc.page_content or "", cfg)
         for part in parts:
-            chunk_id = counters[scope]
-            counters[scope] = chunk_id + 1
+            if not part.strip():
+                continue  # skip empty chunks
 
-            doc_id,page_num = scope
-            doc_id = base_md.get("doc_id", "")
+            chunk_id = counters[(scope_doc_id, scope_page)]
+            counters[(scope_doc_id, scope_page)] = chunk_id + 1
+
+            # Prefer explicit doc_id in metadata, else fallback to scope-derived id
+            doc_id = base_md.get("doc_id") or scope_doc_id
+            page_num = base_md.get("page", scope_page)
+
             chunk_uid = f"{doc_id}:{page_num}:{chunk_id}"
-            checksum = _sha256_hex(part.encode("utf-8"))
+            checksum = _sha256_hex(part.encode("utf-8", errors="ignore"))
 
             md = dict(base_md)
             md.update(
                 {
-                    "chunk_id":chunk_id,
-                    "chunk_uid":chunk_uid,
-                    "chunk_checksum":checksum
+                    "chunk_id": chunk_id,
+                    "chunk_uid": chunk_uid,
+                    "chunk_checksum": checksum,
                 }
             )
 
-            out.append(Document(page_content=part,metadata = md))
-    return out
+            out.append(Document(page_content=part, metadata=md))
 
+    return out
         
 
 

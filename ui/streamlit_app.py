@@ -5,11 +5,69 @@ import requests
 from typing import Dict, List, Optional, Any
 import streamlit as st
 
-# ---------- Config ----------
+# ====== Config ======
 API_BASE = os.getenv("API_BASE", "http://localhost:8000")
 TIMEOUT = 30
+LS_KEY = "smart_rag_auth_v1"  # localStorage key
 
-# ---------- Session Helpers ----------
+# LocalStorage bridge (requires: pip install streamlit-js-eval)
+try:
+    from streamlit_js_eval import get_local_storage, set_local_storage, remove_local_storage
+except Exception:
+    # Fallback stubs if the lib isn't installed yet (app will still run, but won't persist across refresh)
+    def get_local_storage(key: str) -> Optional[str]:
+        return None
+    def set_local_storage(key: str, value: str) -> None:
+        pass
+    def remove_local_storage(key: str) -> None:
+        pass
+
+
+# ====== Session helpers & LS sync ======
+def _auth_snapshot_from_state() -> dict:
+    return {
+        # Tokens
+        "jwt":          st.session_state.get("jwt"),          # current token (login or tenant)
+        "login_jwt":    st.session_state.get("login_jwt"),    # login-scoped token (used for switch-tenant)
+        # Identity / scope
+        "tenant_id":    st.session_state.get("tenant_id"),
+        "tenant_name":  st.session_state.get("tenant_name"),
+        "role":         st.session_state.get("role"),
+        "email":        st.session_state.get("email"),
+        "memberships":  st.session_state.get("memberships", []),
+        # UI prefs
+        "provider":     st.session_state.get("provider", "stub"),
+        # Optional: persist chat so it doesn’t vanish on refresh (cleared on logout/switch)
+        "messages":     st.session_state.get("messages", []),
+    }
+
+def _hydrate_state_from_snapshot(snap: dict) -> None:
+    if not isinstance(snap, dict):
+        return
+    for k, v in snap.items():
+        st.session_state[k] = v
+
+def _write_auth_to_localstorage():
+    try:
+        set_local_storage(LS_KEY, json.dumps(_auth_snapshot_from_state()))
+    except Exception:
+        pass
+
+def _read_auth_from_localstorage() -> Optional[dict]:
+    try:
+        raw = get_local_storage(LS_KEY)
+        if raw:
+            return json.loads(raw)
+    except Exception:
+        pass
+    return None
+
+def _clear_auth_localstorage():
+    try:
+        remove_local_storage(LS_KEY)
+    except Exception:
+        pass
+
 def _ss_get(key: str, default=None):
     if key not in st.session_state:
         st.session_state[key] = default
@@ -18,16 +76,23 @@ def _ss_get(key: str, default=None):
 def _ss_set(**kwargs):
     for k, v in kwargs.items():
         st.session_state[k] = v
+    _write_auth_to_localstorage()  # keep LS in sync on every mutation
+
+def _ss_reset_chat():
+    st.session_state["messages"] = []
+    _write_auth_to_localstorage()
 
 def clear_auth_state():
-    for k in ("jwt", "tenant_id", "tenant_name", "role", "email", "memberships"):
+    for k in ("jwt", "login_jwt", "tenant_id", "tenant_name", "role", "email", "memberships", "provider", "messages"):
         st.session_state.pop(k, None)
+    _clear_auth_localstorage()
 
 def ensure_message_buffer():
     if "messages" not in st.session_state:
-        st.session_state["messages"] = []  # list of {"role":"user|assistant", "text":"..."}
+        st.session_state["messages"] = []
 
-# ---------- API Helpers ----------
+
+# ====== API helpers ======
 def api_get(path: str, token: Optional[str] = None, params: Optional[Dict[str, Any]] = None):
     url = f"{API_BASE.rstrip('/')}/{path.lstrip('/')}"
     headers = {}
@@ -46,14 +111,22 @@ def api_post(path: str, token: Optional[str] = None, json_body: Optional[Dict[st
     else:
         return requests.post(url, headers=headers, files=files, data=data, timeout=TIMEOUT)
 
-# ---------- UI: Auth ----------
+def api_delete(path: str, token: Optional[str] = None):
+    url = f"{API_BASE.rstrip('/')}/{path.lstrip('/')}"
+    headers = {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return requests.delete(url, headers=headers, timeout=TIMEOUT)
+
+
+# ====== Auth UI ======
 def auth_panel():
     st.header("🔐 Sign in / Sign up")
     tabs = st.tabs(["Login", "Sign up"])
 
-    # ---- Login tab (no tenant selection here) ----
+    # ---- Login tab ----
     with tabs[0]:
-        with st.form("login_form"):
+        with st.form("login_form", clear_on_submit=True):
             email = st.text_input("Email", key="login_email")
             password = st.text_input("Password", type="password", key="login_password")
             submitted = st.form_submit_button("Login")
@@ -62,32 +135,37 @@ def auth_panel():
                 st.error("Email and password are required.")
             else:
                 try:
-                    payload = {"email": email, "password": password}
-                    r = api_post("/auth/login", json_body=payload)
+                    r = api_post("/auth/login", json_body={"email": email, "password": password})
                     if r.status_code == 200:
                         data = r.json()
-                        # A) tenant token directly (rare here)
                         if "token" in data:
+                            # Direct tenant token (rare path)
                             _ss_set(
                                 jwt=data["token"],
+                                login_jwt=None,           # we don't have a login-scoped token here
                                 tenant_id=data.get("tenant_id"),
-                                tenant_name=data.get("tenant_name"),  # may or may not be present
+                                tenant_name=data.get("tenant_name"),
                                 role=data.get("role"),
                                 email=email,
-                                memberships=[],
+                                memberships=[],           # no list in this path
                             )
+                            ensure_message_buffer()
                             st.success("Logged in.")
-                        # B) login token + memberships (choose from sidebar)
+                            st.rerun()
                         elif "login_token" in data:
+                            # Normal path: keep login_jwt for future tenant switches
                             _ss_set(
-                                jwt=data["login_token"],
+                                jwt=data["login_token"],      # current token is the login token (until scoping)
+                                login_jwt=data["login_token"],
                                 tenant_id=None,
                                 tenant_name=None,
                                 role=None,
                                 email=email,
-                                memberships=data.get("memberships", []),  # [{tenant_id, tenant_name, role}]
+                                memberships=data.get("memberships", []),
                             )
+                            ensure_message_buffer()
                             st.info("Logged in. Pick a tenant from the sidebar to continue.")
+                            st.rerun()
                         else:
                             st.warning("Unexpected response shape.")
                     else:
@@ -100,12 +178,8 @@ def auth_panel():
         with st.form("signup_form"):
             s_email = st.text_input("Email", key="signup_email")
             s_password = st.text_input("Password", type="password", key="signup_password")
+            mode = st.radio("Choose onboarding mode", ["Create a new tenant", "Join an existing tenant"], key="signup_mode")
 
-            mode = st.radio(
-                "Choose onboarding mode",
-                ["Create a new tenant", "Join an existing tenant"],
-                key="signup_mode"
-            )
             tenant_name = ""
             tenant_join = ""
             joined_tenant_name = None
@@ -113,7 +187,7 @@ def auth_panel():
             if mode == "Create a new tenant":
                 tenant_name = st.text_input("New tenant name", key="signup_tenant_name")
             else:
-                st.write("Search or paste a tenant slug/ID. (Enumeration allowed)")
+                st.write("Search or paste a tenant slug/ID.")
                 q = st.text_input("Search tenants", key="tenant_search_q")
                 tenant_list = []
                 if q.strip():
@@ -122,7 +196,6 @@ def auth_panel():
                         tenant_list = resp.json().get("tenants", [])
                     else:
                         st.warning(f"Search failed: {resp.status_code} {resp.text}")
-                # keep a mapping to resolve name for display state later
                 label_to_item = {f'{t["name"]} [{t["slug"]}]': t for t in tenant_list}
                 options = list(label_to_item.keys()) or ["(no results)"]
                 choice = st.selectbox("Choose a tenant", options=options, key="tenant_join_pick")
@@ -137,91 +210,141 @@ def auth_panel():
             else:
                 body = {"email": s_email, "password": s_password}
                 if mode == "Create a new tenant":
-                    if not tenant_name.strip():
+                    if not (tenant_name or "").strip():
                         st.error("Please provide a tenant name.")
-                    else:
-                        body.update({"mode": "create_tenant", "tenant_name": tenant_name.strip()})
+                        return
+                    body.update({"mode": "create_tenant", "tenant_name": tenant_name.strip()})
                 else:
                     if not tenant_join:
                         st.error("Select a tenant to join.")
-                    else:
-                        body.update({"mode": "join_tenant", "tenant_id": tenant_join})
+                        return
+                    body.update({"mode": "join_tenant", "tenant_id": tenant_join})
 
                 r = api_post("/auth/signup", json_body=body)
                 if r.status_code == 200:
                     data = r.json()
-                    # Store name as well for UI (created or joined)
                     effective_name = tenant_name.strip() if mode == "Create a new tenant" else (joined_tenant_name or None)
                     _ss_set(
-                        jwt=data["token"],
+                        jwt=data["token"],            # tenant-scoped token
+                        login_jwt=None,               # signup flow doesn’t issue login token
                         tenant_id=data.get("tenant_id"),
                         tenant_name=effective_name,
                         role=data.get("role"),
                         email=s_email,
-                        memberships=[],
+                        memberships=[],               # scoped already
                     )
+                    _ss_reset_chat()
                     st.success("Account created and tenant selected.")
+                    st.rerun()
                 else:
                     st.error(f"Signup failed: {r.status_code} {r.text}")
 
-# ---------- Sidebar: Tenant selection AFTER login ----------
+
+# ====== Sidebar: Tenant & Provider (post-login) ======
 def tenant_sidebar():
+    # Rehydrate provider default to keep selectbox index valid
+    if _ss_get("provider") is None:
+        _ss_set(provider="stub")
+
     jwt = _ss_get("jwt")
     if not jwt:
         st.sidebar.info("Log in to pick a tenant.")
         return
 
     st.sidebar.markdown("### 🏷️ Tenant")
+
+    # Provider selector (only when authenticated)
+    st.sidebar.markdown("#### LLM Provider")
+    provider_options = ["stub", "gemini", "groq"]
+    current_provider = _ss_get("provider") or "stub"
+    try:
+        idx = provider_options.index(current_provider)
+    except ValueError:
+        idx = 0
+    provider = st.sidebar.selectbox("Choose provider", provider_options, index=idx, key="provider_select")
+    _ss_set(provider=provider)
+
+    # Current tenant badge
     current_tenant_id = _ss_get("tenant_id")
     current_tenant_name = _ss_get("tenant_name")
-    memberships = _ss_get("memberships", [])
-
     if current_tenant_name:
         st.sidebar.success(f"Current: {current_tenant_name} ({_ss_get('role') or '-'})")
     elif current_tenant_id:
-        # Fallback (shouldn’t happen often)
         st.sidebar.success(f"Current: {current_tenant_id} ({_ss_get('role') or '-'})")
     else:
         st.sidebar.warning("No tenant selected.")
 
-    # If we have memberships from login, offer a picker to switch
-    if memberships:
-        # Build label -> item map
-        # memberships items: {"tenant_id", "tenant_name", "role"}
-        label_to_item = {
-            f'{m["tenant_name"]} ({m.get("role","")}) [{m["tenant_id"]}]': m
-            for m in memberships
-        }
-        if label_to_item:
-            choice = st.sidebar.selectbox(
-                "Switch tenant",
-                list(label_to_item.keys()),
-                key="tenant_pick_sidebar",
-            )
-            if st.sidebar.button("Switch Tenant"):
-                chosen = label_to_item[choice]
-                chosen_id = chosen["tenant_id"]
-                chosen_name = chosen["tenant_name"]
-                r = api_post("/auth/switch-tenant", token=jwt, json_body={"tenant_id": chosen_id})
+    # Switch / Create
+    memberships = _ss_get("memberships", []) or []
+    options = []
+    value_to_item = {}
+    for m in memberships:
+        label = f'{m["tenant_name"]} ({m.get("role","")})'
+        options.append(label)
+        value_to_item[label] = m
+    options.append("➕ Create new tenant…")
+
+    choice = st.sidebar.selectbox("Switch or create", options, key="tenant_pick_sidebar")
+
+    if choice == "➕ Create new tenant…":
+        new_name = st.sidebar.text_input("New tenant name", key="new_tenant_name_sidebar")
+        if st.sidebar.button("Create"):
+            nm = (new_name or "").strip()
+            if not nm:
+                st.sidebar.error("Tenant name required")
+            else:
+                # /auth/tenants/create accepts login or tenant token in your updated backend
+                r = api_post("/auth/tenants/create", token=_ss_get("jwt"), json_body={"name": nm})
                 if r.status_code == 200:
                     data = r.json()
-                    # Now we have a tenant-scoped token; persist both id and name
+                    # Switch to the new tenant immediately
                     _ss_set(
-                        jwt=data["token"],
+                        jwt=data["token"],                         # tenant token for new tenant
                         tenant_id=data["tenant_id"],
-                        tenant_name=chosen_name,   # <-- keep friendly name locally
+                        tenant_name=data.get("tenant_name", nm),
+                        role=data.get("role", "owner"),
+                    )
+                    # Keep the login_jwt if we have it, so user can still switch later
+                    ms = _ss_get("memberships", []) or []
+                    ms.append({
+                        "tenant_id": data["tenant_id"],
+                        "tenant_name": data.get("tenant_name", nm),
+                        "role": "owner",
+                    })
+                    _ss_set(memberships=ms)
+                    _ss_reset_chat()
+                    st.sidebar.success(f"Created & switched to {data.get('tenant_name', nm)}")
+                    st.rerun()
+                else:
+                    st.sidebar.error(f"Create failed: {r.status_code} {r.text}")
+    else:
+        chosen = value_to_item.get(choice)
+        if chosen:
+            # We need the LOGIN token to switch tenants
+            login_jwt = _ss_get("login_jwt")
+            disabled = login_jwt is None
+            help_txt = None
+            if disabled:
+                help_txt = "To switch tenants, please log out and log back in (we need a login token)."
+
+            if st.sidebar.button("Switch Tenant", disabled=disabled, help=help_txt):
+                r = api_post("/auth/switch-tenant", token=login_jwt, json_body={"tenant_id": chosen["tenant_id"]})
+                if r.status_code == 200:
+                    data = r.json()
+                    _ss_set(
+                        jwt=data["token"],                 # new tenant-scoped token
+                        tenant_id=data["tenant_id"],
+                        tenant_name=chosen["tenant_name"],
                         role=data.get("role"),
                     )
-                    # Once scoped, memberships list can be cleared (optional)
-                    st.session_state.pop("memberships", None)
-                    st.sidebar.success(f"Switched to {chosen_name}")
+                    _ss_reset_chat()
+                    st.sidebar.success(f"Switched to {chosen['tenant_name']}")
                     st.rerun()
                 else:
                     st.sidebar.error(f"Switch tenant failed: {r.status_code} {r.text}")
-    else:
-        st.sidebar.caption("No memberships loaded. If needed, log out and log back in to refresh.")
 
-# ---------- UI: Header ----------
+
+# ====== Header ======
 def header_bar():
     jwt = _ss_get("jwt")
     tenant_name = _ss_get("tenant_name")
@@ -243,7 +366,8 @@ def header_bar():
         else:
             st.warning("Not authenticated")
 
-# ---------- UI: Ingest ----------
+
+# ====== Ingest UI ======
 def ingest_panel():
     st.header("📥 Ingest")
     jwt = _ss_get("jwt")
@@ -282,7 +406,62 @@ def ingest_panel():
             else:
                 st.error(f"URL ingest failed: {r.status_code} {r.text}")
 
-# ---------- UI: Chat ----------
+
+# ====== Documents UI ======
+def documents_panel():
+    st.header("📄 Documents")
+    jwt = _ss_get("jwt")
+    tenant_id = _ss_get("tenant_id")
+
+    if not jwt:
+        st.info("Please log in first.")
+        return
+    if not tenant_id:
+        st.info("Pick a tenant from the sidebar first.")
+        return
+
+    col1, col2 = st.columns([0.2, 0.8])
+    with col1:
+        if st.button("🔁 Refresh"):
+            st.rerun()
+
+    # Fetch list
+    r = api_get("/documents", token=jwt)
+    # print("DOCS STATUS:", r.status_code)
+    # print("DOCS BODY:", r.text[:2000])
+    if r.status_code != 200:
+        st.error(f"Failed to load: {r.status_code} {r.text}")
+        return
+
+    items = r.json().get("items", [])
+    if not items:
+        st.info("No documents found for this tenant yet.")
+        return
+
+    for doc in items:
+        # with st.expander(f'{doc["title"]}  •  {doc["source"]}'):
+        with st.expander(f' {doc["source"]}'):
+            st.write(f'**Chunks:** {doc["chunk_count"]}')
+            st.caption(f'Created: {doc["created_at"]}')
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button("🗑️ Delete", key=f"del_{doc['id']}"):
+                    rr = api_delete(f"/documents/{doc['id']}", token=jwt)
+                    if rr.status_code == 200:
+                        st.success("Deleted.")
+                        st.rerun()
+                    else:
+                        st.error(f"Delete failed: {rr.status_code} {rr.text}")
+            with c2:
+                if st.button("♻️ Reindex (stub)", key=f"re_{doc['id']}"):
+                    rr = api_post(f"/documents/reindex/{doc['id']}", token=jwt, json_body={})
+                    if rr.status_code == 200:
+                        st.success("Reindex request accepted.")
+                    else:
+                        st.error(f"Reindex failed: {rr.status_code} {rr.text}")
+
+
+# ====== Chat UI ======
 def chat_panel():
     st.header("💬 Chat")
     jwt = _ss_get("jwt")
@@ -296,15 +475,18 @@ def chat_panel():
 
     ensure_message_buffer()
 
-    # Render history (local echo only; Redis is the source of truth on the server)
+    # Render history
     for m in st.session_state["messages"]:
         role = m.get("role", "user")
         with st.chat_message(role):
             st.write(m.get("text", ""))
 
+    provider = _ss_get("provider", "stub")
+
     prompt = st.chat_input("Ask a question")
     if prompt:
         st.session_state["messages"].append({"role": "user", "text": prompt})
+        _write_auth_to_localstorage()  # persist chat after user message
         with st.chat_message("user"):
             st.write(prompt)
 
@@ -312,7 +494,7 @@ def chat_panel():
             "session_id": "demo-session",
             "question": prompt,
             "k": 4,
-            "provider": "stub",   # change once Gemini/Groq wired
+            "provider": provider,
             "use_mmr": True,
             "mmr_lambda": 0.7,
         }
@@ -327,6 +509,7 @@ def chat_panel():
                     if sources:
                         st.caption("Sources: " + ", ".join(sources))
                     st.session_state["messages"].append({"role": "assistant", "text": answer})
+                    _write_auth_to_localstorage()  # persist chat after assistant reply
                 elif r.status_code == 401:
                     st.error("Unauthorized — your token might be missing or expired.")
                 else:
@@ -334,9 +517,22 @@ def chat_panel():
             except Exception as e:
                 st.exception(e)
 
-# ---------- Main ----------
+
+# ====== Main ======
 def main():
     st.set_page_config(page_title="Smart RAG Chatbot", page_icon="🤖", layout="wide")
+
+    # Rehydrate once per new Streamlit session
+    if not st.session_state.get("_rehydrated_from_ls"):
+        snap = _read_auth_from_localstorage()
+        if isinstance(snap, dict) and (snap.get("jwt") or snap.get("login_jwt")):
+            _hydrate_state_from_snapshot(snap)
+        # Ensure defaults exist
+        if _ss_get("provider") is None:
+            _ss_set(provider="stub")
+        if "messages" not in st.session_state:
+            st.session_state["messages"] = []
+        st.session_state["_rehydrated_from_ls"] = True
 
     # Sidebar tenant controls (post-login)
     tenant_sidebar()
@@ -344,20 +540,19 @@ def main():
     # Top header
     header_bar()
 
-    jwt = _ss_get("jwt")
-    tenant_id = _ss_get("tenant_id")
-
-    # If not authenticated, show the auth panel only
-    if not jwt:
+    # If not authenticated, show auth panel only
+    if not _ss_get("jwt"):
         auth_panel()
         return
 
-    # Authenticated: show app sections
-    tab = st.sidebar.radio("Navigate", ["Chat", "Ingest", "Account"])
+    # Authenticated: show sections
+    tab = st.sidebar.radio("Navigate", ["Chat", "Ingest", "Documents", "Account"])
     if tab == "Chat":
         chat_panel()
     elif tab == "Ingest":
         ingest_panel()
+    elif tab == "Documents":
+        documents_panel()
     else:
         st.header("👤 Account")
         st.write(f"Email: {_ss_get('email') or '-'}")
@@ -367,21 +562,79 @@ def main():
             clear_auth_state()
             st.rerun()
 
+
 if __name__ == "__main__":
     main()
 
-# # streamlit_app.py
 # import os
 # import json
 # import requests
 # from typing import Dict, List, Optional, Any
 # import streamlit as st
 
-# # ---------- Config ----------
+# # ====== Config ======
 # API_BASE = os.getenv("API_BASE", "http://localhost:8000")
 # TIMEOUT = 30
+# LS_KEY = "smart_rag_auth_v1"  # localStorage key
 
-# # ---------- Session Helpers ----------
+# # LocalStorage bridge
+# try:
+#     from streamlit_js_eval import get_local_storage, set_local_storage, remove_local_storage
+# except Exception:
+#     # Fallback stubs if the lib isn't installed yet (app will still run, but won't persist across refresh)
+#     def get_local_storage(key: str) -> Optional[str]:
+#         return None
+#     def set_local_storage(key: str, value: str) -> None:
+#         pass
+#     def remove_local_storage(key: str) -> None:
+#         pass
+
+
+# # ====== Session helpers & LS sync ======
+# def _auth_snapshot_from_state() -> dict:
+#     return {
+#         # Tokens
+#         "jwt":          st.session_state.get("jwt"),          # current token (login or tenant)
+#         "login_jwt":    st.session_state.get("login_jwt"),    # login-scoped token (used for switch-tenant)
+#         # Identity / scope
+#         "tenant_id":    st.session_state.get("tenant_id"),
+#         "tenant_name":  st.session_state.get("tenant_name"),
+#         "role":         st.session_state.get("role"),
+#         "email":        st.session_state.get("email"),
+#         "memberships":  st.session_state.get("memberships", []),
+#         # UI prefs
+#         "provider":     st.session_state.get("provider", "stub"),
+#         # Optional: persist chat so it doesn’t vanish on refresh (cleared on logout/switch)
+#         "messages":     st.session_state.get("messages", []),
+#     }
+
+# def _hydrate_state_from_snapshot(snap: dict) -> None:
+#     if not isinstance(snap, dict):
+#         return
+#     for k, v in snap.items():
+#         st.session_state[k] = v
+
+# def _write_auth_to_localstorage():
+#     try:
+#         set_local_storage(LS_KEY, json.dumps(_auth_snapshot_from_state()))
+#     except Exception:
+#         pass
+
+# def _read_auth_from_localstorage() -> Optional[dict]:
+#     try:
+#         raw = get_local_storage(LS_KEY)
+#         if raw:
+#             return json.loads(raw)
+#     except Exception:
+#         pass
+#     return None
+
+# def _clear_auth_localstorage():
+#     try:
+#         remove_local_storage(LS_KEY)
+#     except Exception:
+#         pass
+
 # def _ss_get(key: str, default=None):
 #     if key not in st.session_state:
 #         st.session_state[key] = default
@@ -390,16 +643,23 @@ if __name__ == "__main__":
 # def _ss_set(**kwargs):
 #     for k, v in kwargs.items():
 #         st.session_state[k] = v
+#     _write_auth_to_localstorage()  # keep LS in sync on every mutation
+
+# def _ss_reset_chat():
+#     st.session_state["messages"] = []
+#     _write_auth_to_localstorage()
 
 # def clear_auth_state():
-#     for k in ("jwt", "tenant_id", "role", "email", "memberships"):
+#     for k in ("jwt", "login_jwt", "tenant_id", "tenant_name", "role", "email", "memberships", "provider", "messages"):
 #         st.session_state.pop(k, None)
+#     _clear_auth_localstorage()
 
 # def ensure_message_buffer():
 #     if "messages" not in st.session_state:
-#         st.session_state["messages"] = []  # list of {"role":"user|assistant", "text":"..."}
+#         st.session_state["messages"] = []
 
-# # ---------- API Helpers ----------
+
+# # ====== API helpers ======
 # def api_get(path: str, token: Optional[str] = None, params: Optional[Dict[str, Any]] = None):
 #     url = f"{API_BASE.rstrip('/')}/{path.lstrip('/')}"
 #     headers = {}
@@ -416,17 +676,23 @@ if __name__ == "__main__":
 #         headers["Content-Type"] = "application/json"
 #         return requests.post(url, headers=headers, json=json_body or {}, timeout=TIMEOUT)
 #     else:
-#         # multipart/form-data (for file upload) or form fields
 #         return requests.post(url, headers=headers, files=files, data=data, timeout=TIMEOUT)
 
-# # ---------- UI: Auth ----------
+# def api_delete(path: str, token: Optional[str] = None):
+#     url = f"{API_BASE.rstrip('/')}/{path.lstrip('/')}"
+#     headers = {}
+#     if token:
+#         headers["Authorization"] = f"Bearer {token}"
+#     return requests.delete(url, headers=headers, timeout=TIMEOUT)
+
+# # ====== Auth UI ======
 # def auth_panel():
 #     st.header("🔐 Sign in / Sign up")
 #     tabs = st.tabs(["Login", "Sign up"])
 
-#     # ---- Login tab (no tenant selection here) ----
+#     # ---- Login tab ----
 #     with tabs[0]:
-#         with st.form("login_form"):
+#         with st.form("login_form", clear_on_submit=True):
 #             email = st.text_input("Email", key="login_email")
 #             password = st.text_input("Password", type="password", key="login_password")
 #             submitted = st.form_submit_button("Login")
@@ -435,25 +701,37 @@ if __name__ == "__main__":
 #                 st.error("Email and password are required.")
 #             else:
 #                 try:
-#                     payload = {"email": email, "password": password}
-#                     r = api_post("/auth/login", json_body=payload)
+#                     r = api_post("/auth/login", json_body={"email": email, "password": password})
 #                     if r.status_code == 200:
 #                         data = r.json()
-#                         # Possible shapes from your backend:
-#                         # A) tenant token directly (rare for login now)
 #                         if "token" in data:
-#                             _ss_set(jwt=data["token"], tenant_id=data.get("tenant_id"), role=data.get("role"), email=email)
-#                             st.success("Logged in.")
-#                         # B) login token + memberships (tenant selection will be in sidebar)
-#                         elif "login_token" in data:
+#                             # Direct tenant token (rare path)
 #                             _ss_set(
-#                                 jwt=data["login_token"],
+#                                 jwt=data["token"],
+#                                 login_jwt=None,           # we don't have a login-scoped token here
+#                                 tenant_id=data.get("tenant_id"),
+#                                 tenant_name=data.get("tenant_name"),
+#                                 role=data.get("role"),
+#                                 email=email,
+#                                 memberships=[],           # no list in this path
+#                             )
+#                             ensure_message_buffer()
+#                             st.success("Logged in.")
+#                             st.rerun()
+#                         elif "login_token" in data:
+#                             # Normal path: keep login_jwt for future tenant switches
+#                             _ss_set(
+#                                 jwt=data["login_token"],      # current token is the login token (until scoping)
+#                                 login_jwt=data["login_token"],
 #                                 tenant_id=None,
+#                                 tenant_name=None,
 #                                 role=None,
 #                                 email=email,
 #                                 memberships=data.get("memberships", []),
 #                             )
+#                             ensure_message_buffer()
 #                             st.info("Logged in. Pick a tenant from the sidebar to continue.")
+#                             st.rerun()
 #                         else:
 #                             st.warning("Unexpected response shape.")
 #                     else:
@@ -461,23 +739,21 @@ if __name__ == "__main__":
 #                 except Exception as e:
 #                     st.exception(e)
 
-#     # ---- Sign up tab (kept with create/join flows) ----
+#     # ---- Sign up tab ----
 #     with tabs[1]:
 #         with st.form("signup_form"):
 #             s_email = st.text_input("Email", key="signup_email")
 #             s_password = st.text_input("Password", type="password", key="signup_password")
+#             mode = st.radio("Choose onboarding mode", ["Create a new tenant", "Join an existing tenant"], key="signup_mode")
 
-#             mode = st.radio(
-#                 "Choose onboarding mode",
-#                 ["Create a new tenant", "Join an existing tenant"],
-#                 key="signup_mode"
-#             )
 #             tenant_name = ""
 #             tenant_join = ""
+#             joined_tenant_name = None
+
 #             if mode == "Create a new tenant":
 #                 tenant_name = st.text_input("New tenant name", key="signup_tenant_name")
 #             else:
-#                 st.write("Search or paste a tenant slug/ID. (Enumeration allowed)")
+#                 st.write("Search or paste a tenant slug/ID.")
 #                 q = st.text_input("Search tenants", key="tenant_search_q")
 #                 tenant_list = []
 #                 if q.strip():
@@ -486,87 +762,158 @@ if __name__ == "__main__":
 #                         tenant_list = resp.json().get("tenants", [])
 #                     else:
 #                         st.warning(f"Search failed: {resp.status_code} {resp.text}")
-#                 label_to_id = {f'{t["name"]} [{t["slug"]}]': t["id"] for t in tenant_list}
-#                 default_label = next(iter(label_to_id.keys()), None)
-#                 tenant_join_label = st.selectbox(
-#                     "Choose a tenant",
-#                     options=list(label_to_id.keys()) or ["(no results)"],
-#                     index=0 if default_label else 0,
-#                     key="tenant_join_pick"
-#                 )
-#                 if label_to_id:
-#                     tenant_join = label_to_id.get(tenant_join_label, "")
+#                 label_to_item = {f'{t["name"]} [{t["slug"]}]': t for t in tenant_list}
+#                 options = list(label_to_item.keys()) or ["(no results)"]
+#                 choice = st.selectbox("Choose a tenant", options=options, key="tenant_join_pick")
+#                 if label_to_item and choice in label_to_item:
+#                     tenant_join = label_to_item[choice]["id"]
+#                     joined_tenant_name = label_to_item[choice]["name"]
 
 #             submitted = st.form_submit_button("Create account")
 #         if submitted:
 #             if not s_email or not s_password:
 #                 st.error("Email and password are required.")
 #             else:
-#                 body = {
-#                     "email": s_email,
-#                     "password": s_password,
-#                 }
+#                 body = {"email": s_email, "password": s_password}
 #                 if mode == "Create a new tenant":
-#                     if not tenant_name.strip():
+#                     if not (tenant_name or "").strip():
 #                         st.error("Please provide a tenant name.")
-#                     else:
-#                         body.update({"mode": "create_tenant", "tenant_name": tenant_name.strip()})
+#                         return
+#                     body.update({"mode": "create_tenant", "tenant_name": tenant_name.strip()})
 #                 else:
 #                     if not tenant_join:
 #                         st.error("Select a tenant to join.")
-#                     else:
-#                         body.update({"mode": "join_tenant", "tenant_id": tenant_join})
+#                         return
+#                     body.update({"mode": "join_tenant", "tenant_id": tenant_join})
 
 #                 r = api_post("/auth/signup", json_body=body)
 #                 if r.status_code == 200:
 #                     data = r.json()
-#                     # Sign-up issues tenant-scoped token directly in this model
-#                     _ss_set(jwt=data["token"], tenant_id=data.get("tenant_id"), role=data.get("role"), email=s_email)
+#                     effective_name = tenant_name.strip() if mode == "Create a new tenant" else (joined_tenant_name or None)
+#                     _ss_set(
+#                         jwt=data["token"],            # tenant-scoped token
+#                         login_jwt=None,               # signup flow doesn’t issue login token
+#                         tenant_id=data.get("tenant_id"),
+#                         tenant_name=effective_name,
+#                         role=data.get("role"),
+#                         email=s_email,
+#                         memberships=[],               # scoped already
+#                     )
+#                     _ss_reset_chat()
 #                     st.success("Account created and tenant selected.")
+#                     st.rerun()
 #                 else:
 #                     st.error(f"Signup failed: {r.status_code} {r.text}")
 
-# # ---------- Sidebar: Tenant selection AFTER login ----------
+
+# # ====== Sidebar: Tenant & Provider (post-login) ======
 # def tenant_sidebar():
+#     # Rehydrate provider default to keep selectbox index valid
+#     if _ss_get("provider") is None:
+#         _ss_set(provider="stub")
+
 #     jwt = _ss_get("jwt")
 #     if not jwt:
 #         st.sidebar.info("Log in to pick a tenant.")
 #         return
 
 #     st.sidebar.markdown("### 🏷️ Tenant")
-#     current_tenant = _ss_get("tenant_id")
-#     memberships = _ss_get("memberships", [])
 
-#     if current_tenant:
-#         st.sidebar.success(f"Current tenant: {current_tenant}")
+#     # Provider selector (only when authenticated)
+#     st.sidebar.markdown("#### LLM Provider")
+#     provider_options = ["stub", "gemini", "groq"]
+#     current_provider = _ss_get("provider") or "stub"
+#     try:
+#         idx = provider_options.index(current_provider)
+#     except ValueError:
+#         idx = 0
+#     provider = st.sidebar.selectbox("Choose provider", provider_options, index=idx, key="provider_select")
+#     _ss_set(provider=provider)
+
+#     # Current tenant badge
+#     current_tenant_id = _ss_get("tenant_id")
+#     current_tenant_name = _ss_get("tenant_name")
+#     if current_tenant_name:
+#         st.sidebar.success(f"Current: {current_tenant_name} ({_ss_get('role') or '-'})")
+#     elif current_tenant_id:
+#         st.sidebar.success(f"Current: {current_tenant_id} ({_ss_get('role') or '-'})")
 #     else:
 #         st.sidebar.warning("No tenant selected.")
 
-#     # If we have memberships from login, offer a picker to switch
-#     if memberships:
-#         opts = {f'{m["tenant_name"]} ({m.get("role","")}) [{m.get("tenant_id")}]': m["tenant_id"] for m in memberships}
-#         if opts:
-#             choice = st.sidebar.selectbox("Choose a tenant to switch", list(opts.keys()), key="tenant_pick_sidebar")
-#             if st.sidebar.button("Switch Tenant"):
-#                 chosen_tenant_id = opts[choice]
-#                 r = api_post("/auth/switch-tenant", token=jwt, json_body={"tenant_id": chosen_tenant_id})
+#     # Switch / Create
+#     memberships = _ss_get("memberships", []) or []
+#     options = []
+#     value_to_item = {}
+#     for m in memberships:
+#         label = f'{m["tenant_name"]} ({m.get("role","")})'
+#         options.append(label)
+#         value_to_item[label] = m
+#     options.append("➕ Create new tenant…")
+
+#     choice = st.sidebar.selectbox("Switch or create", options, key="tenant_pick_sidebar")
+
+#     if choice == "➕ Create new tenant…":
+#         new_name = st.sidebar.text_input("New tenant name", key="new_tenant_name_sidebar")
+#         if st.sidebar.button("Create"):
+#             nm = (new_name or "").strip()
+#             if not nm:
+#                 st.sidebar.error("Tenant name required")
+#             else:
+#                 # /auth/tenants/create accepts login or tenant token in your updated backend
+#                 r = api_post("/auth/tenants/create", token=_ss_get("jwt"), json_body={"name": nm})
 #                 if r.status_code == 200:
 #                     data = r.json()
-#                     # Now we should have a tenant-scoped token
-#                     _ss_set(jwt=data["token"], tenant_id=data["tenant_id"], role=data.get("role"))
-#                     # cleanup memberships since we're now scoped
-#                     st.session_state.pop("memberships", None)
-#                     st.sidebar.success(f"Switched to tenant {data['tenant_id']}")
+#                     # Switch to the new tenant immediately
+#                     _ss_set(
+#                         jwt=data["token"],                         # tenant token for new tenant
+#                         tenant_id=data["tenant_id"],
+#                         tenant_name=data.get("tenant_name", nm),
+#                         role=data.get("role", "owner"),
+#                     )
+#                     # Keep the login_jwt if we have it, so user can still switch later
+#                     ms = _ss_get("memberships", []) or []
+#                     ms.append({
+#                         "tenant_id": data["tenant_id"],
+#                         "tenant_name": data.get("tenant_name", nm),
+#                         "role": "owner",
+#                     })
+#                     _ss_set(memberships=ms)
+#                     _ss_reset_chat()
+#                     st.sidebar.success(f"Created & switched to {data.get('tenant_name', nm)}")
+#                     st.rerun()
+#                 else:
+#                     st.sidebar.error(f"Create failed: {r.status_code} {r.text}")
+#     else:
+#         chosen = value_to_item.get(choice)
+#         if chosen:
+#             # We need the LOGIN token to switch tenants
+#             login_jwt = _ss_get("login_jwt")
+#             disabled = login_jwt is None
+#             help_txt = None
+#             if disabled:
+#                 help_txt = "To switch tenants, please log out and log back in (we need a login token)."
+
+#             if st.sidebar.button("Switch Tenant", disabled=disabled, help=help_txt):
+#                 r = api_post("/auth/switch-tenant", token=login_jwt, json_body={"tenant_id": chosen["tenant_id"]})
+#                 if r.status_code == 200:
+#                     data = r.json()
+#                     _ss_set(
+#                         jwt=data["token"],                 # new tenant-scoped token
+#                         tenant_id=data["tenant_id"],
+#                         tenant_name=chosen["tenant_name"],
+#                         role=data.get("role"),
+#                     )
+#                     _ss_reset_chat()
+#                     st.sidebar.success(f"Switched to {chosen['tenant_name']}")
 #                     st.rerun()
 #                 else:
 #                     st.sidebar.error(f"Switch tenant failed: {r.status_code} {r.text}")
-#     else:
-#         st.sidebar.caption("No memberships loaded. If needed, log out and log back in.")
 
-# # ---------- UI: Header ----------
+
+# # ====== Header ======
 # def header_bar():
 #     jwt = _ss_get("jwt")
-#     tenant_id = _ss_get("tenant_id")
+#     tenant_name = _ss_get("tenant_name")
 #     role = _ss_get("role")
 #     email = _ss_get("email")
 #     left, right = st.columns([0.7, 0.3])
@@ -574,8 +921,8 @@ if __name__ == "__main__":
 #         st.caption("Smart RAG Chatbot — Demo UI")
 #     with right:
 #         if jwt:
-#             if tenant_id:
-#                 st.success(f"Tenant: {tenant_id}  |  Role: {role or '-'}")
+#             if tenant_name:
+#                 st.success(f"Tenant: {tenant_name}  |  Role: {role or '-'}")
 #             else:
 #                 st.warning("Tenant: (not selected)")
 #             st.caption(f"Signed in as {email or '-'}")
@@ -585,7 +932,8 @@ if __name__ == "__main__":
 #         else:
 #             st.warning("Not authenticated")
 
-# # ---------- UI: Ingest ----------
+
+# # ====== Ingest UI ======
 # def ingest_panel():
 #     st.header("📥 Ingest")
 #     jwt = _ss_get("jwt")
@@ -624,7 +972,56 @@ if __name__ == "__main__":
 #             else:
 #                 st.error(f"URL ingest failed: {r.status_code} {r.text}")
 
-# # ---------- UI: Chat ----------
+# def documents_panel():
+#     st.header("📄 Documents")
+#     jwt = _ss_get("jwt")
+#     tenant_id = _ss_get("tenant_id")
+
+#     if not jwt:
+#         st.info("Please log in first.")
+#         return
+#     if not tenant_id:
+#         st.info("Pick a tenant from the sidebar first.")
+#         return
+
+#     col1, col2 = st.columns([0.2, 0.8])
+#     with col1:
+#         if st.button("🔁 Refresh"):
+#             st.experimental_rerun()
+
+#     # Fetch list
+#     r = api_get("/docs", token=jwt)
+#     if r.status_code != 200:
+#         st.error(f"Failed to load: {r.status_code} {r.text}")
+#         return
+#     print(r)
+#     items = r.json().get("items", [])
+#     if not items:
+#         st.info("No documents found for this tenant yet.")
+#         return
+
+#     for doc in items:
+#         with st.expander(f'{doc["title"]}  •  {doc["source"]}'):
+#             st.write(f'**Chunks:** {doc["chunk_count"]}')
+#             st.caption(f'Created: {doc["created_at"]}')
+#             c1, c2 = st.columns(2)
+#             with c1:
+#                 if st.button("🗑️ Delete", key=f"del_{doc['id']}"):
+#                     rr = api_delete(f"/docs/{doc['id']}", token=jwt)
+#                     if rr.status_code == 200:
+#                         st.success("Deleted.")
+#                         st.experimental_rerun()
+#                     else:
+#                         st.error(f"Delete failed: {rr.status_code} {rr.text}")
+#             with c2:
+#                 if st.button("♻️ Reindex (stub)", key=f"re_{doc['id']}"):
+#                     rr = api_post(f"/docs/reindex/{doc['id']}", token=jwt, json_body={})
+#                     if rr.status_code == 200:
+#                         st.success("Reindex request accepted.")
+#                     else:
+#                         st.error(f"Reindex failed: {rr.status_code} {rr.text}")
+
+# # ====== Chat UI ======
 # def chat_panel():
 #     st.header("💬 Chat")
 #     jwt = _ss_get("jwt")
@@ -638,23 +1035,26 @@ if __name__ == "__main__":
 
 #     ensure_message_buffer()
 
-#     # Render history (local echo only; Redis is the source of truth on the server)
+#     # Render history
 #     for m in st.session_state["messages"]:
 #         role = m.get("role", "user")
 #         with st.chat_message(role):
 #             st.write(m.get("text", ""))
 
+#     provider = _ss_get("provider", "stub")
+
 #     prompt = st.chat_input("Ask a question")
 #     if prompt:
 #         st.session_state["messages"].append({"role": "user", "text": prompt})
+#         _write_auth_to_localstorage()  # persist chat after user message
 #         with st.chat_message("user"):
 #             st.write(prompt)
 
 #         body = {
-#             "session_id": "demo-session",  # or per-browser unique
+#             "session_id": "demo-session",
 #             "question": prompt,
 #             "k": 4,
-#             "provider": "stub",   # change once Gemini/Groq wired
+#             "provider": provider,
 #             "use_mmr": True,
 #             "mmr_lambda": 0.7,
 #         }
@@ -669,6 +1069,7 @@ if __name__ == "__main__":
 #                     if sources:
 #                         st.caption("Sources: " + ", ".join(sources))
 #                     st.session_state["messages"].append({"role": "assistant", "text": answer})
+#                     _write_auth_to_localstorage()  # persist chat after assistant reply
 #                 elif r.status_code == 401:
 #                     st.error("Unauthorized — your token might be missing or expired.")
 #                 else:
@@ -676,9 +1077,22 @@ if __name__ == "__main__":
 #             except Exception as e:
 #                 st.exception(e)
 
-# # ---------- Main ----------
+
+# # ====== Main ======
 # def main():
 #     st.set_page_config(page_title="Smart RAG Chatbot", page_icon="🤖", layout="wide")
+
+#     # Rehydrate once per new Streamlit session
+#     if not st.session_state.get("_rehydrated_from_ls"):
+#         snap = _read_auth_from_localstorage()
+#         if isinstance(snap, dict) and (snap.get("jwt") or snap.get("login_jwt")):
+#             _hydrate_state_from_snapshot(snap)
+#         # Ensure defaults exist
+#         if _ss_get("provider") is None:
+#             _ss_set(provider="stub")
+#         if "messages" not in st.session_state:
+#             st.session_state["messages"] = []
+#         st.session_state["_rehydrated_from_ls"] = True
 
 #     # Sidebar tenant controls (post-login)
 #     tenant_sidebar()
@@ -686,538 +1100,28 @@ if __name__ == "__main__":
 #     # Top header
 #     header_bar()
 
-#     jwt = _ss_get("jwt")
-#     tenant_id = _ss_get("tenant_id")
-
-#     # If not authenticated, show the auth panel only
-#     if not jwt:
+#     # If not authenticated, show auth panel only
+#     if not _ss_get("jwt"):
 #         auth_panel()
 #         return
 
-#     # Authenticated: show app sections
-#     tab = st.sidebar.radio("Navigate", ["Chat", "Ingest", "Account"])
+#     # Authenticated: show sections
+#     tab = st.sidebar.radio("Navigate", ["Chat", "Ingest", "Account","Documents"])
 #     if tab == "Chat":
 #         chat_panel()
 #     elif tab == "Ingest":
 #         ingest_panel()
+#     elif tab == "Documents":
+#         documents_panel()
 #     else:
 #         st.header("👤 Account")
 #         st.write(f"Email: {_ss_get('email') or '-'}")
-#         st.write(f"Tenant: {tenant_id or '(not selected)'}")
+#         st.write(f"Tenant: {_ss_get('tenant_name') or '(not selected)'}")
 #         st.write(f"Role: {_ss_get('role') or '-'}")
 #         if st.button("Log out (clear token)"):
 #             clear_auth_state()
 #             st.rerun()
 
+
 # if __name__ == "__main__":
 #     main()
-
-# # # streamlit_app.py
-# # import os
-# # import time
-# # import json
-# # import requests
-# # from typing import Dict, List, Optional, Any
-# # import streamlit as st
-
-# # # ---------- Config ----------
-# # API_BASE = os.getenv("API_BASE", "http://localhost:8000")
-# # TIMEOUT = 30
-
-# # # ---------- Session Helpers ----------
-# # def _ss_get(key: str, default=None):
-# #     if key not in st.session_state:
-# #         st.session_state[key] = default
-# #     return st.session_state[key]
-
-# # def _ss_set(**kwargs):
-# #     for k, v in kwargs.items():
-# #         st.session_state[k] = v
-
-# # def clear_auth_state():
-# #     for k in ("jwt", "tenant_id", "role", "email", "memberships"):
-# #         st.session_state.pop(k, None)
-
-# # def ensure_message_buffer():
-# #     if "messages" not in st.session_state:
-# #         st.session_state["messages"] = []  # list of {"role":"user|assistant", "text":"..."}
-
-# # # ---------- API Helpers ----------
-# # def api_get(path: str, token: Optional[str] = None, params: Optional[Dict[str, Any]] = None):
-# #     url = f"{API_BASE.rstrip('/')}/{path.lstrip('/')}"
-# #     headers = {}
-# #     if token:
-# #         headers["Authorization"] = f"Bearer {token}"
-# #     r = requests.get(url, headers=headers, params=params or {}, timeout=TIMEOUT)
-# #     return r
-
-# # def api_post(path: str, token: Optional[str] = None, json_body: Optional[Dict[str, Any]] = None, files=None, data=None):
-# #     url = f"{API_BASE.rstrip('/')}/{path.lstrip('/')}"
-# #     headers = {}
-# #     if token:
-# #         headers["Authorization"] = f"Bearer {token}"
-# #     if files is None and data is None:
-# #         headers["Content-Type"] = "application/json"
-# #         r = requests.post(url, headers=headers, json=json_body or {}, timeout=TIMEOUT)
-# #     else:
-# #         # multipart/form-data (for file upload) or form fields
-# #         r = requests.post(url, headers=headers, files=files, data=data, timeout=TIMEOUT)
-# #     return r
-
-# # # ---------- UI: Auth ----------
-# # def auth_panel():
-# #     st.header("🔐 Sign in / Sign up")
-
-# #     tabs = st.tabs(["Login", "Sign up"])
-
-# #     # ---- Login tab ----
-# #     with tabs[0]:
-# #         with st.form("login_form"):
-# #             email = st.text_input("Email", key="login_email")
-# #             password = st.text_input("Password", type="password", key="login_password")
-# #             tenant_choice = st.text_input(
-# #                 "Tenant (optional: paste tenant_id or slug to directly login to a tenant)",
-# #                 key="login_tenant_opt",
-# #                 help="If provided and you are a member, the server will issue a tenant-scoped token right away."
-# #             )
-# #             submitted = st.form_submit_button("Login")
-# #         if submitted:
-# #             if not email or not password:
-# #                 st.error("Email and password are required.")
-# #             else:
-# #                 try:
-# #                     payload = {"email": email, "password": password}
-# #                     if tenant_choice.strip():
-# #                         payload["tenant_id"] = tenant_choice.strip()
-# #                     r = api_post("/auth/login", json_body=payload)
-# #                     if r.status_code == 200:
-# #                         data = r.json()
-# #                         # Two possible shapes:
-# #                         # A) tenant token directly
-# #                         if "token" in data:
-# #                             _ss_set(jwt=data["token"], tenant_id=data.get("tenant_id"), role=data.get("role"), email=email)
-# #                             st.success("Logged in with tenant.")
-# #                         # B) login token + memberships (choose tenant)
-# #                         elif "login_token" in data and "memberships" in data:
-# #                             _ss_set(jwt=data["login_token"], tenant_id=None, role=None, email=email, memberships=data["memberships"])
-# #                             st.info("Choose a tenant below and press Switch Tenant.")
-# #                         else:
-# #                             st.warning("Unexpected response shape.")
-# #                     else:
-# #                         st.error(f"Login failed: {r.status_code} {r.text}")
-# #                 except Exception as e:
-# #                     st.exception(e)
-
-# #         # If we got memberships back, show a selector to get tenant-scoped JWT
-# #         memberships = _ss_get("memberships", [])
-# #         if memberships:
-# #             st.subheader("Pick a tenant")
-# #             opts = {f'{m["tenant_name"]} ({m.get("role","")}) [{m.get("tenant_id")}]': m["tenant_id"] for m in memberships}
-# #             choice = st.selectbox("Tenant", list(opts.keys()), key="tenant_pick")
-# #             if st.button("Switch Tenant"):
-# #                 chosen_tenant_id = opts[choice]
-# #                 r = api_post("/auth/switch-tenant", token=_ss_get("jwt"), json_body={"tenant_id": chosen_tenant_id})
-# #                 if r.status_code == 200:
-# #                     data = r.json()
-# #                     # Now we should have a tenant token
-# #                     _ss_set(jwt=data["token"], tenant_id=data["tenant_id"], role=data.get("role"))
-# #                     st.success(f"Switched to tenant {data['tenant_id']}")
-# #                     # cleanup memberships list
-# #                     st.session_state.pop("memberships", None)
-# #                 else:
-# #                     st.error(f"Switch tenant failed: {r.status_code} {r.text}")
-
-# #     # ---- Sign up tab ----
-# #     with tabs[1]:
-# #         with st.form("signup_form"):
-# #             s_email = st.text_input("Email", key="signup_email")
-# #             s_password = st.text_input("Password", type="password", key="signup_password")
-
-# #             mode = st.radio(
-# #                 "Choose onboarding mode",
-# #                 ["Create a new tenant", "Join an existing tenant"],
-# #                 key="signup_mode"
-# #             )
-# #             tenant_name = ""
-# #             tenant_join = ""
-# #             if mode == "Create a new tenant":
-# #                 tenant_name = st.text_input("New tenant name", key="signup_tenant_name")
-# #             else:
-# #                 st.write("Search or paste a tenant slug/ID. (Enumeration allowed)")
-# #                 q = st.text_input("Search tenants", key="tenant_search_q")
-# #                 tenant_list = []
-# #                 if q.strip():
-# #                     resp = api_get("/auth/tenants/search", params={"q": q.strip()})
-# #                     if resp.status_code == 200:
-# #                         tenant_list = resp.json().get("tenants", [])
-# #                     else:
-# #                         st.warning(f"Search failed: {resp.status_code} {resp.text}")
-# #                 label_to_id = {f'{t["name"]} [{t["slug"]}]': t["id"] for t in tenant_list}
-# #                 default_label = next(iter(label_to_id.keys()), None)
-# #                 tenant_join_label = st.selectbox("Choose a tenant", options=list(label_to_id.keys()) or ["(no results)"], index=0 if default_label else 0, key="tenant_join_pick")
-# #                 if label_to_id:
-# #                     tenant_join = label_to_id.get(tenant_join_label, "")
-
-# #             submitted = st.form_submit_button("Create account")
-# #         if submitted:
-# #             if not s_email or not s_password:
-# #                 st.error("Email and password are required.")
-# #             else:
-# #                 body = {
-# #                     "email": s_email,
-# #                     "password": s_password,
-# #                 }
-# #                 if mode == "Create a new tenant":
-# #                     if not tenant_name.strip():
-# #                         st.error("Please provide a tenant name.")
-# #                     else:
-# #                         body.update({"mode": "create_tenant", "tenant_name": tenant_name.strip()})
-# #                 else:
-# #                     if not tenant_join:
-# #                         st.error("Select a tenant to join.")
-# #                     else:
-# #                         body.update({"mode": "join_tenant", "tenant_id": tenant_join})
-
-# #                 r = api_post("/auth/signup", json_body=body)
-# #                 if r.status_code == 200:
-# #                     data = r.json()
-# #                     # Sign-up issues tenant-scoped token directly in this simple model
-# #                     _ss_set(jwt=data["token"], tenant_id=data.get("tenant_id"), role=data.get("role"), email=s_email)
-# #                     st.success("Account created and tenant selected.")
-# #                 else:
-# #                     st.error(f"Signup failed: {r.status_code} {r.text}")
-
-# # # ---------- UI: Header ----------
-# # def header_bar():
-# #     jwt = _ss_get("jwt")
-# #     tenant_id = _ss_get("tenant_id")
-# #     role = _ss_get("role")
-# #     email = _ss_get("email")
-# #     left, right = st.columns([0.7, 0.3])
-# #     with left:
-# #         st.caption("Smart RAG Chatbot — Demo UI")
-# #     with right:
-# #         if jwt and tenant_id:
-# #             st.success(f"Tenant: {tenant_id}  |  Role: {role or '-'}")
-# #             st.caption(f"Signed in as {email or '-'}")
-# #             if st.button("Log out"):
-# #                 clear_auth_state()
-# #                 st.experimental_rerun()
-# #         else:
-# #             st.warning("Not authenticated")
-
-# # # ---------- UI: Ingest ----------
-# # def ingest_panel():
-# #     st.header("📥 Ingest")
-# #     jwt = _ss_get("jwt")
-# #     tenant_id = _ss_get("tenant_id")
-
-# #     if not jwt or not tenant_id:
-# #         st.info("Please log in and select a tenant first.")
-# #         return
-
-# #     st.subheader("Upload a file")
-# #     f = st.file_uploader("PDF or TXT", type=["pdf", "txt"], key="upload_file")
-# #     if st.button("Ingest File"):
-# #         if f is None:
-# #             st.error("Choose a file first.")
-# #         else:
-# #             files = {"file": (f.name, f.getvalue(), f"type" if hasattr(f, "type") else "application/octet-stream")}
-# #             r = api_post("/ingest", token=jwt, files=files)
-# #             if r.status_code == 200:
-# #                 st.success(f"Ingested: {r.json()}")
-# #             else:
-# #                 st.error(f"Upload failed: {r.status_code} {r.text}")
-
-# #     st.subheader("Ingest URLs")
-# #     urls_csv = st.text_area("Enter one or more URLs (comma or newline separated)")
-# #     if st.button("Ingest URLs"):
-# #         urls = [u.strip() for u in urls_csv.replace("\n", ",").split(",") if u.strip()]
-# #         if not urls:
-# #             st.error("Provide at least one URL.")
-# #         else:
-# #             r = api_post("/ingest", token=jwt, json_body={"urls": urls})
-# #             if r.status_code == 200:
-# #                 st.success(f"Ingested: {r.json()}")
-# #             else:
-# #                 st.error(f"URL ingest failed: {r.status_code} {r.text}")
-
-# # # ---------- UI: Chat ----------
-# # def chat_panel():
-# #     st.header("💬 Chat")
-# #     jwt = _ss_get("jwt")
-# #     tenant_id = _ss_get("tenant_id")
-# #     if not jwt or not tenant_id:
-# #         st.info("Please log in and select a tenant first.")
-# #         return
-
-# #     ensure_message_buffer()
-
-# #     # Render history (local echo only; Redis is the source of truth on the server)
-# #     for m in st.session_state["messages"]:
-# #         role = m.get("role", "user")
-# #         with st.chat_message(role):
-# #             st.write(m.get("text", ""))
-
-# #     # Input
-# #     prompt = st.chat_input("Ask a question")
-# #     if prompt:
-# #         st.session_state["messages"].append({"role": "user", "text": prompt})
-# #         with st.chat_message("user"):
-# #             st.write(prompt)
-
-# #         # Call backend /query
-# #         body = {
-# #             "session_id": "demo-session",  # or something unique per browser/user
-# #             "question": prompt,
-# #             "k": 4,
-# #             "provider": "stub",      # you can change once you wire Gemini/Groq
-# #             "use_mmr": True,
-# #             "mmr_lambda": 0.7,
-# #         }
-# #         with st.chat_message("assistant"):
-# #             try:
-# #                 r = api_post("/query", token=jwt, json_body=body)
-# #                 if r.status_code == 200:
-# #                     data = r.json()
-# #                     answer = data.get("answer", "")
-# #                     sources = data.get("sources", [])
-# #                     st.write(answer)
-# #                     if sources:
-# #                         st.caption("Sources: " + ", ".join(sources))
-# #                     st.session_state["messages"].append({"role": "assistant", "text": answer})
-# #                 elif r.status_code == 401:
-# #                     st.error("Unauthorized — your token might be missing or expired.")
-# #                 else:
-# #                     st.error(f"Query failed: {r.status_code} {r.text}")
-# #             except Exception as e:
-# #                 st.exception(e)
-
-# # # ---------- Main ----------
-# # def main():
-# #     st.set_page_config(page_title="Smart RAG Chatbot", page_icon="🤖", layout="wide")
-# #     header_bar()
-
-# #     jwt = _ss_get("jwt")
-# #     tenant_id = _ss_get("tenant_id")
-
-# #     # If not authenticated, show the auth panel only
-# #     if not jwt or not tenant_id:
-# #         auth_panel()
-# #         return
-
-# #     # Authenticated: show app sections
-# #     tab = st.sidebar.radio("Navigate", ["Chat", "Ingest", "Account"])
-# #     if tab == "Chat":
-# #         chat_panel()
-# #     elif tab == "Ingest":
-# #         ingest_panel()
-# #     else:
-# #         st.header("👤 Account")
-# #         st.write(f"Email: {_ss_get('email') or '-'}")
-# #         st.write(f"Tenant: {tenant_id}")
-# #         st.write(f"Role: {_ss_get('role') or '-'}")
-# #         if st.button("Log out (clear token)"):
-# #             clear_auth_state()
-# #             st.experimental_rerun()
-
-# # if __name__ == "__main__":
-# #     main()
-
-# # # # ui/streamlit_app.py  (put anywhere; I like /ui)
-# # # from __future__ import annotations
-
-# # # import os
-# # # import uuid
-# # # import time
-# # # import requests
-# # # from typing import Dict, Any, List, Optional
-
-# # # import streamlit as st
-
-
-# # # # ---------- Config ----------
-# # # DEFAULT_API_BASE = os.getenv("API_BASE", "http://localhost:8000")
-
-# # # st.set_page_config(page_title="Smart RAG Chatbot", page_icon="🤖", layout="wide")
-
-# # # if "session_id" not in st.session_state:
-# # #     st.session_state.session_id = str(uuid.uuid4())
-
-# # # if "messages" not in st.session_state:
-# # #     # local echo of the conversation for display only; Redis keeps the “truth”
-# # #     st.session_state.messages = []
-
-
-# # # # ---------- Helpers ----------
-# # # def auth_headers(token: Optional[str]) -> Dict[str, str]:
-# # #     return {"Authorization": f"Bearer {token}"} if token else {}
-
-
-# # # def api_post(path: str, json: Optional[dict] = None, files=None, data=None, token: Optional[str] = None):
-# # #     url = f"{st.session_state.api_base}{path}"
-# # #     headers = auth_headers(token)
-# # #     return requests.post(url, json=json, files=files, data=data, headers=headers, timeout=60)
-
-
-# # # def api_get(path: str, token: Optional[str] = None):
-# # #     url = f"{st.session_state.api_base}{path}"
-# # #     headers = auth_headers(token)
-# # #     return requests.get(url, headers=headers, timeout=20)
-
-
-# # # def render_sources(sources: List[str] | List[dict]) -> str:
-# # #     if not sources:
-# # #         return ""
-# # #     # our API returns a simple list[str] today; B2 metadata also has {source, chunk_id}
-# # #     if isinstance(sources[0], dict):
-# # #         parts = [f"{s.get('source','?')}#{s.get('chunk_id','')}" for s in sources]  # type: ignore[index]
-# # #     else:
-# # #         parts = [str(s) for s in sources]  # type: ignore[assignment]
-# # #     return "Sources: " + ", ".join(parts)
-
-
-# # # # ---------- Sidebar ----------
-# # # with st.sidebar:
-# # #     st.markdown("## Settings")
-
-# # #     api_default = st.session_state.get("api_base", DEFAULT_API_BASE)
-# # #     st.session_state.api_base = st.text_input("API base", api_default, help="FastAPI base URL")
-
-# # #     st.session_state.jwt = st.text_input(
-# # #         "JWT Bearer token",
-# # #         value=st.session_state.get("jwt", ""),
-# # #         type="password",
-# # #         help="Required for /ingest and /query",
-# # #     )
-
-# # #     provider = st.selectbox(
-# # #         "Provider",
-# # #         options=["gemini",  "groq", "stub"],
-# # #         index=["gemini",  "groq", "stub"].index("gemini"),
-# # #     )
-
-# # #     mmr_used = st.toggle("Use MMR (diversity)", value=False)
-# # #     mmr_lambda = st.slider("MMR λ (relevance↔diversity)", 0.0, 1.0, 0.5, 0.05, disabled=not mmr_used)
-# # #     top_k = st.slider("Top-K", 1, 10, 4, 1)
-
-# # #     st.divider()
-# # #     st.markdown("### Rebuild / Ingest")
-
-# # #     upl = st.file_uploader("Upload PDF/TXT", type=["pdf", "txt"])
-# # #     urls_text = st.text_area("URLs (comma/newline separated)")
-
-# # #     col_ing_a, col_ing_b = st.columns(2)
-# # #     with col_ing_a:
-# # #         if st.button("Ingest", use_container_width=True):
-# # #             try:
-# # #                 with st.spinner("Ingesting…"):
-# # #                     # Prepare multipart if file present
-# # #                     files = None
-# # #                     data = {}
-# # #                     if upl is not None:
-# # #                         files = {"file": (upl.name, upl, upl.type or "application/octet-stream")}
-# # #                     # URLs can be sent as JSON OR as form; we’ll prefer JSON call if no file,
-# # #                     # otherwise send form field 'urls' so backend path works for multipart.
-# # #                     if urls_text.strip():
-# # #                         urls = [u.strip() for u in urls_text.replace(",", "\n").splitlines() if u.strip()]
-# # #                     else:
-# # #                         urls = []
-
-# # #                     if files and urls:
-# # #                         # multipart with form field 'urls' (can repeat)
-# # #                         # requests supports repeated keys via list of tuples:
-# # #                         data = [("urls_form", ",".join(urls))]
-# # #                         resp = api_post("/ingest", files=files, data=data, token=st.session_state.jwt)
-# # #                     elif files:
-# # #                         resp = api_post("/ingest", files=files, token=st.session_state.jwt)
-# # #                     else:
-# # #                         resp = api_post("/ingest", json={"urls": urls}, token=st.session_state.jwt)
-
-# # #                     if resp.status_code == 200:
-# # #                         js = resp.json()
-# # #                         st.success(
-# # #                             f"Ingested {js.get('ingested', 0)} chunks "
-# # #                             f"(load={js['durations_ms'].get('load')}ms, index={js['durations_ms'].get('index')}ms)"
-# # #                         )
-# # #                         if js.get("failures"):
-# # #                             st.warning("Failures: " + "; ".join(js["failures"]))
-# # #                     elif resp.status_code == 401:
-# # #                         st.error("Unauthorized (401). Check your JWT token in the sidebar.")
-# # #                     else:
-# # #                         st.error(f"Error {resp.status_code}: {resp.text}")
-# # #             except Exception as e:
-# # #                 st.exception(e)
-# # #     with col_ing_b:
-# # #         if st.button("Health check", use_container_width=True):
-# # #             try:
-# # #                 r = api_get("/health")
-# # #                 if r.ok:
-# # #                     st.success(r.json())
-# # #                 else:
-# # #                     st.error(f"{r.status_code}: {r.text}")
-# # #             except Exception as e:
-# # #                 st.exception(e)
-
-# # #     st.divider()
-# # #     st.caption(f"Session: `{st.session_state.session_id}`")
-
-
-# # # # ---------- Main Chat ----------
-# # # st.title("Smart RAG Chatbot by Prashanth Madishetti")
-
-# # # # show existing conversation
-# # # for m in st.session_state.messages:
-# # #     with st.chat_message(m["role"]):
-# # #         st.markdown(m["content"])
-
-# # # # chat input
-# # # prompt = st.chat_input("Ask me something…")
-# # # if prompt:
-# # #     # display immediately
-# # #     st.session_state.messages.append({"role": "user", "content": prompt})
-# # #     with st.chat_message("user"):
-# # #         st.markdown(prompt)
-
-# # #     # call backend
-# # #     try:
-# # #         t0 = time.time()
-# # #         body = {
-# # #             "question": prompt,
-# # #             "session_id": st.session_state.session_id,
-# # #             "k": int(top_k),
-# # #             "provider": provider,
-# # #         }
-# # #         # optional B1 controls if your /query supports them
-# # #         if mmr_used:
-# # #             body["use_mmr"] = True
-# # #             body["mmr_lambda"] = float(mmr_lambda)
-
-# # #         resp = api_post("/query", json=body, token=st.session_state.jwt)
-# # #         t1 = time.time()
-# # #         latency_ms = int((t1 - t0) * 1000)
-
-# # #         if resp.status_code == 200:
-# # #             js = resp.json()
-# # #             answer = js.get("answer", "")
-# # #             provider_used = js.get("provider", provider)
-# # #             sources = js.get("sources", [])
-
-# # #             with st.chat_message("assistant"):
-# # #                 st.markdown(answer)
-# # #                 meta_line = f"_{provider_used}_ • {render_sources(sources)} • {latency_ms}ms"
-# # #                 st.caption(meta_line)
-
-# # #             st.session_state.messages.append(
-# # #                 {"role": "assistant", "content": f"{answer}\n\n_{provider_used}_"}
-# # #             )
-# # #         elif resp.status_code == 401:
-# # #             with st.chat_message("assistant"):
-# # #                 st.error("Unauthorized (401). Add a valid JWT token in the sidebar.")
-# # #         else:
-# # #             with st.chat_message("assistant"):
-# # #                 st.error(f"Error {resp.status_code}: {resp.text}")
-
-# # #     except Exception as e:
-# # #         with st.chat_message("assistant"):
-# # #             st.exception(e)
