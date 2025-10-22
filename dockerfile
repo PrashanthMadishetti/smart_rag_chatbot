@@ -46,11 +46,11 @@ RUN chown -R appuser:appuser /app
 USER appuser
 
 # Container paths you’ll use
-ENV INDEX_DIR=/data/indexes/faiss \
-    HOST=0.0.0.0 \
-    PORT=8000
+# ENV INDEX_DIR=/data/indexes/faiss \
+#     HOST=0.0.0.0 \
+#     PORT=8000
 
-EXPOSE 8000
+
 
 # Default command (no reload in production image)
 # Dockerfile (bottom)
