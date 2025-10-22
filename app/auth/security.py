@@ -11,7 +11,7 @@ ACCESS_TTL = int(os.getenv("ACCESS_TTL_SECONDS", "3600"))   # 1 hour default
 LOGIN_TTL  = int(os.getenv("LOGIN_TTL_SECONDS", "900"))     # 15 minutes default
 
 def hash_password(plain: str) -> str:
-    rounds = int(os.getenv("PASSWORD_HASH_ROUNDS", "12"))
+    rounds = int(os.getenv("BCRYPT_ROUNDS", "12"))
     salt = bcrypt.gensalt(rounds)
     return bcrypt.hashpw(plain.encode("utf-8"), salt).decode("utf-8")
 

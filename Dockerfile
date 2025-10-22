@@ -5,23 +5,29 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
-# System deps (slim but covers faiss/torch openmp runtime + basic build needs)
+# System deps (OpenMP for faiss/torch + build tools)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential git curl libgomp1 && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Install deps into a venv for smaller runtime image & better caching
+# Create a venv so runtime stays slim
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-# If using requirements.txt:
+# Install deps (torch from CPU index first, then the rest)
 COPY requirements.txt .
-# RUN pip install --upgrade pip && pip install -r requirements.txt
 RUN pip install --upgrade pip \
  && pip install --index-url https://download.pytorch.org/whl/cpu torch==2.5.1 \
  && pip install -r requirements.txt
+
+# Pre-download a small SentenceTransformers model at build time
+# (Make sure 'sentence-transformers' is listed in requirements.txt)
+RUN python - <<'PY'
+from sentence_transformers import SentenceTransformer
+SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
+PY
 
 # ========= Runtime =========
 FROM python:3.11-slim
@@ -42,17 +48,17 @@ RUN useradd -m appuser
 
 WORKDIR /app
 COPY . /app
-RUN chown -R appuser:appuser /app
+
+# Copy the Hugging Face cache that builder created into the appuser home,
+# so the model is already on disk at runtime (no cold-start download)
+# (Default HF cache path in builder is /root/.cache/huggingface)
+RUN mkdir -p /home/appuser/.cache/huggingface
+COPY --from=builder /root/.cache/huggingface /home/appuser/.cache/huggingface
+
+# Ownership
+RUN chown -R appuser:appuser /app /home/appuser/.cache
 USER appuser
 
-# Container paths you’ll use
-# ENV INDEX_DIR=/data/indexes/faiss \
-#     HOST=0.0.0.0 \
-#     PORT=8000
-
-
-
-# Default command (no reload in production image)
-# Dockerfile (bottom)
+# Cloud Run expects port 8080
 EXPOSE 8080
-CMD ["/bin/sh", "-c", "uvicorn api.main:app --host 0.0.0.0 --port ${PORT:-8080}"]
+CMD ["/bin/sh","-c","uvicorn api.main:app --host 0.0.0.0 --port ${PORT:-8080}"]
