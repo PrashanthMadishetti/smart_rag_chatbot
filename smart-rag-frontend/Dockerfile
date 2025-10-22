@@ -1,0 +1,51 @@
+# smart-rag-frontend/Dockerfile
+FROM python:3.11-slim
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+WORKDIR /app
+
+# System deps (if you need them for streamlit components)
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential curl && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r /app/requirements.txt
+
+COPY ui/ /app/ui/
+
+# IMPORTANT: Cloud Run will set $PORT; default to 8080
+ENV PORT=8080 HOST=0.0.0.0 PYTHONPATH=/app
+EXPOSE 8080
+
+CMD ["streamlit", "run", "ui/streamlit_app.py", "--server.address=0.0.0.0", "--server.port=${PORT:-8080}" ,"--browser.gatherUsageStats=false"]
+     
+# FROM python:3.11-slim
+
+# ENV PYTHONDONTWRITEBYTECODE=1 \
+#     PYTHONUNBUFFERED=1
+
+# WORKDIR /app
+
+# # System deps (for some streamlit components)
+# RUN apt-get update && apt-get install -y --no-install-recommends \
+#     build-essential curl && \
+#     rm -rf /var/lib/apt/lists/*
+
+# # Install only what UI needs
+# COPY requirements.txt /app/requirements.txt
+# RUN pip install --no-cache-dir --upgrade pip && \
+#     pip install --no-cache-dir -r /app/requirements.txt
+
+# # Copy only UI
+# COPY ui/ /app/ui/
+
+# # Default Streamlit config
+# ENV PORT=8501 \
+#     HOST=0.0.0.0 \
+#     PYTHONPATH=/app
+
+# EXPOSE 8501
+
+# CMD ["streamlit", "run", "ui/streamlit_app.py", \
+#      "--server.address=0.0.0.0", "--server.port=8501", \
+#      "--browser.gatherUsageStats=false"]

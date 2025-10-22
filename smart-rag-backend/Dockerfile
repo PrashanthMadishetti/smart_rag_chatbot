@@ -55,5 +55,6 @@ RUN chown -R appuser:appuser /app /home/appuser/.cache
 USER appuser
 
 # Cloud Run expects port 8080
-EXPOSE 8080
-CMD ["/bin/sh","-c","uvicorn api.main:app --host 0.0.0.0 --port ${PORT:-8080}"]
+# EXPOSE 8080
+CMD ["/bin/sh","-c","uvicorn api.main:app --host 0.0.0.0 "]
+# --port ${PORT:-8080}
