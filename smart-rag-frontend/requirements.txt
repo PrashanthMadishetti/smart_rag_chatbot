@@ -1,0 +1,6 @@
+streamlit
+streamlit-js-eval
+requests
+PyJWT
+tqdm>=4.66.0
+pandas>=2.0.0

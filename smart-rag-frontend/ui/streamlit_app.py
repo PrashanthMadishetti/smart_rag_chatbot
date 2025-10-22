@@ -6,7 +6,7 @@ from typing import Dict, List, Optional, Any
 import streamlit as st
 
 # ====== Config ======
-API_BASE = os.getenv("API_BASE", "http://localhost:8000")
+API_BASE = os.getenv("API_BASE")
 TIMEOUT = 30
 LS_KEY = "smart_rag_auth_v1"  # localStorage key
 
