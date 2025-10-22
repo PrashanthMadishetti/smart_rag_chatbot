@@ -22,12 +22,9 @@ RUN pip install --upgrade pip \
  && pip install --index-url https://download.pytorch.org/whl/cpu torch==2.5.1 \
  && pip install -r requirements.txt
 
-# Pre-download a small SentenceTransformers model at build time
+# Pre-download a small SentenceTransformers model at build time (avoid cold-start download)
 # (Make sure 'sentence-transformers' is listed in requirements.txt)
-RUN python - <<'PY'
-from sentence_transformers import SentenceTransformer
-SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
-PY
+RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')"
 
 # ========= Runtime =========
 FROM python:3.11-slim
@@ -49,9 +46,7 @@ RUN useradd -m appuser
 WORKDIR /app
 COPY . /app
 
-# Copy the Hugging Face cache that builder created into the appuser home,
-# so the model is already on disk at runtime (no cold-start download)
-# (Default HF cache path in builder is /root/.cache/huggingface)
+# Copy the Hugging Face cache that builder created (so appuser can access the preloaded model)
 RUN mkdir -p /home/appuser/.cache/huggingface
 COPY --from=builder /root/.cache/huggingface /home/appuser/.cache/huggingface
 
