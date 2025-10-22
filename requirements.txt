@@ -26,3 +26,4 @@ bcrypt
 psycopg2-binary>=2.9.9
 pinecone>=5.0.0
 requests
+torch==2.5.1

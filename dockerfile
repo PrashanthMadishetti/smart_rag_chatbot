@@ -18,7 +18,10 @@ ENV PATH="/opt/venv/bin:$PATH"
 
 # If using requirements.txt:
 COPY requirements.txt .
-RUN pip install --upgrade pip && pip install -r requirements.txt
+# RUN pip install --upgrade pip && pip install -r requirements.txt
+RUN pip install --upgrade pip \
+ && pip install --index-url https://download.pytorch.org/whl/cpu torch==2.5.1 \
+ && pip install -r requirements.txt
 
 # ========= Runtime =========
 FROM python:3.11-slim
@@ -50,4 +53,6 @@ ENV INDEX_DIR=/data/indexes/faiss \
 EXPOSE 8000
 
 # Default command (no reload in production image)
-CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Dockerfile (bottom)
+EXPOSE 8080
+CMD ["/bin/sh", "-c", "uvicorn api.main:app --host 0.0.0.0 --port ${PORT:-8080}"]

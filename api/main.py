@@ -444,20 +444,6 @@ def create_app() -> FastAPI:
             },
         )
 
-    # ----------- QUERY -----------
-    # @app.post("/query", response_model=QueryResponse)
-    # def query(body: QueryRequest, _: AuthedUser = Depends(require_bearer_auth)):
-    #     results: List[Document] = _INDEX.search(body.question, k=body.k, embedder=_EMBEDDER)
-    #     _METRICS["queries_served_total"] += 1
-
-    #     sources: List[str] = []
-    #     for d in results:
-    #         src = d.metadata.get("source")
-    #         if isinstance(src, str):
-    #             sources.append(src)
-
-    #     answer = _stub_llm_answer(body.question, results)
-    #     return QueryResponse(answer=answer, sources=sources, provider=(body.provider or "stub"))
     
     
     @app.post("/query", response_model=QueryResponse)
